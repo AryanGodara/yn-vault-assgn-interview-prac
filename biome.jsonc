@@ -1,0 +1,149 @@
+{
+    "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+    "files": {
+        "ignore": [
+            "*.config.ts.timestamp-*.mjs",
+            ".next",
+            ".pnpm-store",
+            "build",
+            "contracts/broadcast",
+            "contracts/cache",
+            "contracts/deployments",
+            "contracts/lib",
+            "contracts/out",
+            "dist",
+            "dist.prod",
+            "generated.d.ts",
+            "generated.ts",
+            "node_modules",
+            "routeTree.gen.ts",
+            "./cache",
+            "./lib",
+            "./out",
+            "./deployments",
+            "./broadcast"
+        ]
+    },
+    "formatter": {
+        "enabled": true,
+        "formatWithErrors": false,
+        "indentStyle": "space",
+        "indentWidth": 4,
+        "lineEnding": "lf",
+        "lineWidth": 120,
+        "attributePosition": "auto"
+    },
+    "organizeImports": {
+        "enabled": true
+    },
+    "linter": {
+        "enabled": true,
+        "rules": {
+            "recommended": true,
+            "nursery": {
+                "useSortedClasses": "off"
+            },
+            "correctness": {
+                "noUnusedVariables": {
+                    "level": "warn",
+                    "fix": "unsafe"
+                },
+                "useHookAtTopLevel": "error",
+                "noUnusedImports": {
+                    "level": "warn",
+                    "fix": "unsafe"
+                }
+            },
+            "style": {
+                "noNamespace": "error",
+                "noNonNullAssertion": "off",
+                "useTemplate": "off",
+                "noUselessElse": "off",
+                "noParameterAssign": "off"
+            },
+            "complexity": {
+                "noForEach": "off",
+                "noUselessSwitchCase": "off"
+            },
+            "suspicious": {
+                "noConfusingLabels": "off"
+            }
+        }
+    },
+    "javascript": {
+        "formatter": {
+            "jsxQuoteStyle": "double",
+            "quoteProperties": "asNeeded",
+            "trailingCommas": "all",
+            "semicolons": "asNeeded",
+            "arrowParentheses": "always",
+            "bracketSpacing": true,
+            "bracketSameLine": false,
+            "quoteStyle": "double",
+            "attributePosition": "auto"
+        }
+    },
+    "overrides": [
+        {
+            "include": ["./**/*/tsconfig.*.json", "./**/*/tsconfig.json", "./**/*/api-extractor.json"],
+            "json": {
+                "parser": {
+                    "allowComments": true,
+                    "allowTrailingCommas": true
+                },
+                "formatter": {
+                    "trailingCommas": "none"
+                }
+            }
+        },
+        {
+            "include": ["vite-env.d.ts"],
+            "linter": {
+                "rules": {
+                    "correctness": {
+                        "noUnusedVariables": "off"
+                    }
+                }
+            }
+        },
+        {
+            "include": ["*.spec.ts", "*.test.ts"],
+            "linter": {
+                "rules": {
+                    "suspicious": {
+                        "noExplicitAny": "off"
+                    }
+                }
+            }
+        },
+        {
+            "include": ["*.vue"],
+            "linter": {
+                "rules": {
+                    "style": {
+                        "useConst": "off",
+                        "useImportType": "off"
+                    },
+                    "correctness": {
+                        "noUnusedVariables": "off",
+                        "noUnusedImports": "off",
+                        "useHookAtTopLevel": "off"
+                    }
+                }
+            }
+        },
+        {
+            "include": ["**/src/snippets/*"],
+            "linter": {
+                "rules": {
+                    "suspicious": {
+                        "noConsoleLog": "off"
+                    },
+                    "correctness": {
+                        "noUnusedVariables": "off"
+                    }
+                }
+            }
+        }
+    ]
+}

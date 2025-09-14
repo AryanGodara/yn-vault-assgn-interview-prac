@@ -1,0 +1,12 @@
+# lib
+node_modules
+.vscode
+
+lib
+out
+cache
+
+.env
+.password.local
+.password.main
+.password.test
