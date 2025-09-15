@@ -16,7 +16,6 @@ interface IAaveOracle {
  *         Tests the core Aave operations for leverage looping strategy
  */
 contract AaveV3SupplyTest is Test {
-    // ============ Ethereum Mainnet Addresses ============
     IERC20 public constant WETH =
         IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
     IERC20 public constant wstETH =
@@ -26,7 +25,6 @@ contract AaveV3SupplyTest is Test {
     IAaveOracle public constant AAVE_ORACLE =
         IAaveOracle(0x54586bE62E3c3580375aE3723C145253060Ca0C2);
 
-    // ============ Test Setup ============
     address public testAccount = makeAddr("testAccount");
     uint256 public forkId;
 
@@ -41,11 +39,6 @@ contract AaveV3SupplyTest is Test {
         // Fund test account with WETH (for collateral) and some wstETH (for repayment)
         deal(address(WETH), testAccount, 10 ether);
         deal(address(wstETH), testAccount, 1 ether); // Extra for interest coverage
-
-        console.log("=== Aave V3 Supply Test Setup ===");
-        console.log("Block number:", block.number);
-        console.log("Chain ID:", block.chainid);
-        console.log("Test account WETH balance:", WETH.balanceOf(testAccount));
     }
 
     /**

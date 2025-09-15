@@ -2,34 +2,22 @@
 pragma solidity ^0.8.24;
 
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {BaseDeployScript, console} from "src/deploy/BaseDeployScript.s.sol";
 import {LoopingVaultProvider} from "src/LoopingVaultProvider.sol";
 import {YieldNestLoopingVault} from "src/YieldNestLoopingVault.sol";
-import {BaseDeployScript, console} from "src/deploy/BaseDeployScript.s.sol";
 
 /**
  * @title DeployLoopingVault
  * @notice Deployment script for YieldNestLoopingVault using deterministic CREATE2
  */
 contract DeployLoopingVault is BaseDeployScript {
-    // -----------------------------------------------------------------------------------------
-    // Configuration
-    // -----------------------------------------------------------------------------------------
-
     bytes32 public constant DEPLOYMENT_SALT = bytes32(uint256(0));
 
     string public constant VAULT_NAME = "YieldNest Looping wstETH Vault";
     string public constant VAULT_SYMBOL = "ynLoopwstETH";
 
-    // -----------------------------------------------------------------------------------------
-    // Deployed Contracts
-    // -----------------------------------------------------------------------------------------
-
     YieldNestLoopingVault public vault;
     LoopingVaultProvider public provider;
-
-    // -----------------------------------------------------------------------------------------
-    // Network Configuration
-    // -----------------------------------------------------------------------------------------
 
     struct NetworkConfig {
         address weth;
@@ -82,8 +70,6 @@ contract DeployLoopingVault is BaseDeployScript {
     }
 
     function run() public override {
-        NetworkConfig memory config = getNetworkConfig();
-
         vm.startBroadcast();
         deploy();
         vm.stopBroadcast();
@@ -92,14 +78,10 @@ contract DeployLoopingVault is BaseDeployScript {
     }
 
     function deploy() internal override {
-        NetworkConfig memory config = getNetworkConfig();
-
         // Determine owner address based on network
         address owner = block.chainid == 84532 || block.chainid == 8453
             ? 0x74637F06a8914beB5D00079681c48494FbccBdB9 // Base funded wallet (testnet + mainnet)
             : 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266; // Anvil default account 0
-
-        console.log("Deploying with owner:", owner);
 
         // -----------------------------------------------------------------------------------------
         // Deploy YieldNestLoopingVault Implementation
@@ -136,9 +118,6 @@ contract DeployLoopingVault is BaseDeployScript {
         // -----------------------------------------------------------------------------------------
 
         configureVault(owner);
-
-        console.log("Vault deployed and configured successfully");
-        console.log("Vault:", address(vault));
     }
 
     function configureVault(address owner) internal {
@@ -162,8 +141,6 @@ contract DeployLoopingVault is BaseDeployScript {
 
     /// @dev Deployment for tests - simplified without configuration
     function deployForTests() external {
-        NetworkConfig memory config = getNetworkConfig();
-
         // Determine owner address based on network
         address owner = block.chainid == 84532 || block.chainid == 8453
             ? 0x74637F06a8914beB5D00079681c48494FbccBdB9 // Base funded wallet (testnet + mainnet)
@@ -171,10 +148,8 @@ contract DeployLoopingVault is BaseDeployScript {
 
         // Deploy provider first
         provider = new LoopingVaultProvider();
-        console.log("Provider deployed at:", address(provider));
 
         YieldNestLoopingVault implementation = new YieldNestLoopingVault();
-        console.log("Implementation deployed at:", address(implementation));
 
         // Deploy proxy with initialization
         bytes memory initData = abi.encodeWithSelector(

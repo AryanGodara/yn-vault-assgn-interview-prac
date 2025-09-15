@@ -32,7 +32,6 @@ interface ICurvePool {
  * @dev Tests cbETH leverage looping with Curve, deposits, withdrawals, and emergency functions
  */
 contract YieldNestLoopingVaultTest is Test {
-    // ============ Test Contracts ============
     YieldNestLoopingVault public vault;
     LoopingVaultProvider public provider;
 
@@ -58,7 +57,6 @@ contract YieldNestLoopingVaultTest is Test {
     uint256 public constant INITIAL_WETH_BALANCE = 100 ether;
     uint256 public constant DEPOSIT_AMOUNT = 10 ether;
 
-    // ============ Events for Testing ============
     event LeverageExecuted(
         uint256 initialAmount,
         uint256 finalCollateral,
@@ -230,8 +228,6 @@ contract YieldNestLoopingVaultTest is Test {
     }
 
     function test_MultipleDeposits() public {
-        console.log("=== Multiple Deposits Test ===");
-
         // Create 5 random addresses with realistic deposit amounts
         address[5] memory depositors = [
             makeAddr("depositor1"),
@@ -321,15 +317,6 @@ contract YieldNestLoopingVaultTest is Test {
         assertGt(finalDebt, 0, "Should have debt");
         assertGt(finalHF, 1.1e18, "Final health factor should be safe");
 
-        // For a leveraged vault, share economics may be different due to leverage effects
-        // The test expectation of vault appreciation may not hold in all market conditions
-        // Instead, verify that the vault is functioning properly with reasonable share issuance
-        console.log("Share price analysis:");
-        console.log(
-            "  Assets per share:",
-            (vault.totalAssets() * 1e18) / vault.totalSupply()
-        );
-
         // Verify that share issuance is reasonable (not exponentially increasing)
         // Allow for some leverage effects but prevent excessive share inflation
         assertLt(
@@ -372,7 +359,6 @@ contract YieldNestLoopingVaultTest is Test {
 
         // Test strategy token rate function
         uint256 strategyRate = vault.getStrategyTokenRate();
-        console.log("Strategy Token Rate (ETH per token):", strategyRate);
 
         // Strategy token rate should be positive and reasonable
         assertGt(strategyRate, 0, "Strategy token rate should be positive");
@@ -384,8 +370,6 @@ contract YieldNestLoopingVaultTest is Test {
     }
 
     function test_BasicWithdrawal() public {
-        console.log("=== Basic Withdrawal Test ===");
-
         // First, make a deposit to have something to withdraw
         uint256 depositAmount = 5 ether;
         deal(address(WETH), allocator, depositAmount);

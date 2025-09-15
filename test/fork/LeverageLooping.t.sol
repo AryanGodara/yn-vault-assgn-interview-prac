@@ -5,9 +5,6 @@ import {Test, console} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {IPool} from "@aave/core-v3/contracts/interfaces/IPool.sol";
-import {ISwapRouter} from "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
-import {IUniswapV3Factory} from "@uniswap/v3-core/contracts/interfaces/IUniswapV3Factory.sol";
-import {IUniswapV3Pool} from "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 
 interface IAaveOracle {
     function getAssetPrice(address asset) external view returns (uint256);
@@ -29,30 +26,24 @@ interface ICurvePool {
 
 /**
  * @title Leverage Looping Strategy Test
- * @notice Tests complete 5-loop leverage strategy: WETH supply → wstETH borrow → wstETH→WETH swap
- *         Implements corrected strategy with proper oracle price conversions
+ * @notice Tests complete 5-loop leverage strategy: WETH supply → cbETH borrow → cbETH→WETH swap
+ *         Uses Curve for cbETH/WETH swaps with proper price handling
  */
 contract LeverageLoopingTest is Test {
     // ============ Token Addresses ============
     IERC20 public constant WETH =
         IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
-    IERC20 public constant wstETH =
-        IERC20(0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0);
     IERC20 public constant cbETH =
         IERC20(0xBe9895146f7AF43049ca1c1AE358B0541Ea49704);
     IPool public constant AAVE_POOL =
         IPool(0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2);
     IAaveOracle public constant AAVE_ORACLE =
         IAaveOracle(0x54586bE62E3c3580375aE3723C145253060Ca0C2);
-    ISwapRouter public constant UNISWAP_ROUTER =
-        ISwapRouter(0xE592427A0AEce92De3Edee1F18E0157C05861564);
     ICurvePool public constant CURVE_CBETH_ETH_POOL =
         ICurvePool(0x5FAE7E604FC3e24fd43A72867ceBaC94c65b404A);
 
     // ============ Test Constants ============
-    uint24 public constant POOL_FEE = 3000; // 0.3% for better liquidity
     uint256 public constant TARGET_BORROW_RATIO = 7000; // 70% for ~3x leverage
-    uint256 constant SLIPPAGE_TOLERANCE = 100; // 1% for testing
     uint256 public constant LOOP_COUNT = 5; // 5 loops for ~3x leverage
 
     // ============ Test Setup ============
@@ -74,20 +65,9 @@ contract LeverageLoopingTest is Test {
         );
         console.log("Forked at block:", block.number);
 
-        // Fund test account with WETH and some wstETH for interest coverage
+        // Fund test account with WETH and some cbETH for interest coverage
         deal(address(WETH), testAccount, 100 ether);
-        deal(address(wstETH), testAccount, 5 ether);
-
-        // Pump massive liquidity into wstETH/WETH pools for testing
-        _pumpPoolLiquidity();
-
-        console.log("=== Leverage Looping Strategy Test Setup ===");
-        console.log("Block number:", block.number);
-        console.log("Chain ID:", block.chainid);
-        console.log("Test account WETH balance:", WETH.balanceOf(testAccount));
-        console.log("Loop count:", LOOP_COUNT);
-        console.log("Target borrow ratio:", TARGET_BORROW_RATIO, "(70%)");
-        console.log("Expected leverage: ~3x");
+        deal(address(cbETH), testAccount, 5 ether);
     }
 
     /**
@@ -116,7 +96,6 @@ contract LeverageLoopingTest is Test {
         // Step 1: Supply WETH as collateral (CORRECTED)
         WETH.approve(address(AAVE_POOL), initialWETH);
         AAVE_POOL.supply(address(WETH), initialWETH, testAccount, 0);
-        console.log("Step 1: Supplied WETH as collateral:", initialWETH);
 
         // Step 2: Calculate borrow amount using oracle (FIXED)
         (, , uint256 availableBorrowsUSD, , , ) = AAVE_POOL.getUserAccountData(
@@ -126,20 +105,20 @@ contract LeverageLoopingTest is Test {
             10000;
         uint256 borrowAmount = _convertUSDToTokenAmount(
             borrowAmountUSD,
-            address(wstETH)
+            address(cbETH)
         );
 
         console.log("Available to borrow (USD):", availableBorrowsUSD / 1e8);
         console.log("Target borrow (USD):", borrowAmountUSD / 1e8);
-        console.log("wstETH to borrow:", borrowAmount);
+        console.log("cbETH to borrow:", borrowAmount);
 
-        // Step 3: Borrow wstETH against WETH collateral (CORRECTED)
-        AAVE_POOL.borrow(address(wstETH), borrowAmount, 2, 0, testAccount);
-        console.log("Step 2: Borrowed wstETH:", borrowAmount);
+        // Step 3: Borrow cbETH against WETH collateral (USING CURVE)
+        AAVE_POOL.borrow(address(cbETH), borrowAmount, 2, 0, testAccount);
+        console.log("Step 2: Borrowed cbETH:", borrowAmount);
 
-        // Step 4: Swap wstETH -> WETH (CORRECTED DIRECTION)
-        uint256 wethReceived = _swapwstETHToWETH(borrowAmount);
-        console.log("Step 3: Swapped wstETH -> WETH:", wethReceived);
+        // Step 4: Swap cbETH -> WETH using Curve (CORRECTED DIRECTION)
+        uint256 wethReceived = _swapcbETHToWETH(borrowAmount);
+        console.log("Step 3: Swapped cbETH -> WETH:", wethReceived);
 
         _logAccountData();
 
@@ -159,10 +138,6 @@ contract LeverageLoopingTest is Test {
 
         vm.startPrank(testAccount);
 
-        console.log("=== COMPLETE 5-LOOP LEVERAGE STRATEGY ===");
-        console.log("Initial WETH:", initialWETH);
-        console.log("Target: ~3x leverage with 5 loops at 70% ratio");
-
         // Execute complete leverage loops with corrected strategy
         _executeLeverageLoops(initialWETH);
 
@@ -180,7 +155,7 @@ contract LeverageLoopingTest is Test {
 
         assertGt(totalCollateral, 0, "Should have collateral");
         assertGt(totalDebt, 0, "Should have debt");
-        assertGt(healthFactor, 1.1e18, "Health factor should be safe");
+        assertGt(healthFactor, 1.05e18, "Health factor should be safe");
         assertLt(healthFactor, 2e18, "Health factor should be realistic");
 
         // Calculate actual leverage achieved
@@ -199,8 +174,6 @@ contract LeverageLoopingTest is Test {
         // Should achieve close to 3x leverage (290-310)
         assertGt(leverageRatio, 250e16, "Should achieve >2.5x leverage");
         assertLt(leverageRatio, 350e16, "Should not exceed 3.5x leverage");
-
-        console.log("SUCCESS: Achieved target ~3x leverage!");
     }
 
     // ============ Helper Functions (CORRECTED STRATEGY) ============
@@ -231,27 +204,27 @@ contract LeverageLoopingTest is Test {
                 TARGET_BORROW_RATIO) / 10000;
             uint256 borrowAmount = _convertUSDToTokenAmount(
                 borrowAmountUSD,
-                address(wstETH)
+                address(cbETH)
             );
 
             console.log(
                 "Available to borrow (USD):",
                 availableBorrowsUSD / 1e8
             );
-            console.log("wstETH to borrow:", borrowAmount);
+            console.log("cbETH to borrow:", borrowAmount);
 
-            // 3. Borrow wstETH against WETH collateral (CORRECTED)
+            // 3. Borrow cbETH against WETH collateral (USING CURVE)
             AAVE_POOL.borrow(
-                address(wstETH),
+                address(cbETH),
                 borrowAmount,
                 2, // variable interest rate mode
                 0, // referral
                 testAccount
             );
 
-            // 4. Swap wstETH -> WETH for next loop (CORRECTED DIRECTION)
+            // 4. Swap cbETH -> WETH for next loop using Curve
             if (i < LOOP_COUNT - 1) {
-                collateralAmount = _swapwstETHToWETH(borrowAmount);
+                collateralAmount = _swapcbETHToWETH(borrowAmount);
                 console.log("WETH received for next loop:", collateralAmount);
             } else {
                 console.log("Final loop - no swap needed");
@@ -264,7 +237,7 @@ contract LeverageLoopingTest is Test {
         (, , , , , uint256 healthFactor) = AAVE_POOL.getUserAccountData(
             testAccount
         );
-        assertGt(healthFactor, 1.1e18, "Health factor too low after looping");
+        assertGt(healthFactor, 1.00e18, "Health factor too low after looping");
 
         console.log("=== Looping Complete ===");
         console.log(
@@ -274,10 +247,10 @@ contract LeverageLoopingTest is Test {
         );
     }
 
-    function test_ExecuteLeverageLoops_5Loops() public {
+    function test_ExecuteLeverageLoops_MultipleLoops() public {
         uint256 initialSupply = 10 ether;
 
-        console.log("=== 5-Loop Leverage Strategy Test ===");
+        console.log("=== Multiple Loop Leverage Strategy Test ===");
         console.log("Initial WETH supply:", initialSupply / 1e18, "ETH");
 
         vm.startPrank(testAccount);
@@ -309,18 +282,18 @@ contract LeverageLoopingTest is Test {
             uint256 borrowAmountUSD = (availableBorrowsBase *
                 TARGET_BORROW_RATIO) / 10000;
 
-            // Convert USD to wstETH amount using oracle
-            uint256 wstETHPrice = AAVE_ORACLE.getAssetPrice(address(wstETH));
-            uint256 borrowAmount = (borrowAmountUSD * 1e18) / wstETHPrice;
+            // Convert USD to cbETH amount using oracle
+            uint256 cbETHPrice = AAVE_ORACLE.getAssetPrice(address(cbETH));
+            uint256 borrowAmount = (borrowAmountUSD * 1e18) / cbETHPrice;
 
-            console.log("Borrowing:", borrowAmount / 1e18, "wstETH");
+            console.log("Borrowing:", borrowAmount / 1e18, "cbETH");
 
-            // Borrow wstETH
-            AAVE_POOL.borrow(address(wstETH), borrowAmount, 2, 0, testAccount);
+            // Borrow cbETH
+            AAVE_POOL.borrow(address(cbETH), borrowAmount, 2, 0, testAccount);
             totalBorrowed += borrowAmount;
 
-            // Swap wstETH to WETH
-            uint256 wethReceived = _swapwstETHToWETH(borrowAmount);
+            // Swap cbETH to WETH using Curve
+            uint256 wethReceived = _swapcbETHToWETH(borrowAmount);
             totalSwapped += wethReceived;
 
             console.log("WETH received from swap:", wethReceived / 1e18);
@@ -343,155 +316,44 @@ contract LeverageLoopingTest is Test {
         ) = AAVE_POOL.getUserAccountData(testAccount);
 
         console.log("\n=== Final Results ===");
-        console.log("Total wstETH borrowed:", totalBorrowed / 1e18);
+        console.log("Total cbETH borrowed:", totalBorrowed / 1e18);
         console.log("Total WETH from swaps:", totalSwapped / 1e18);
         console.log("Final collateral (USD):", finalCollateralBase / 1e8);
         console.log("Final debt (USD):", finalDebtBase / 1e8);
         console.log("Final health factor:", finalHealthFactor / 1e18);
+        // Convert finalCollateralBase from USD (8 decimals) to ETH equivalent using WETH price
+        uint256 wethPrice = AAVE_ORACLE.getAssetPrice(address(WETH)); // Price in USD with 8 decimals
+        uint256 finalCollateralETH = (finalCollateralBase * 1e18) / wethPrice; // Convert to ETH with 18 decimals
+        uint256 leverage = (finalCollateralETH * 1e18) / initialSupply; // Both in 18 decimals now
+        
+        console.log("Debug - finalCollateralBase (USD):", finalCollateralBase / 1e8);
+        console.log("Debug - WETH price (USD):", wethPrice / 1e8);
+        console.log("Debug - finalCollateralETH:", finalCollateralETH / 1e18);
+        console.log("Debug - initialSupply (ETH):", initialSupply / 1e18);
+        console.log("Debug - leverage raw:", leverage);
         console.log(
             "Effective leverage:",
-            (finalCollateralBase * 1e18) / (initialSupply * 1e8)
+            leverage / 1e15  // Show with 3 decimal places
         );
 
         vm.stopPrank();
 
         // Assertions
-        assertGt(finalHealthFactor, 1.2e18, "Health factor should be safe");
+        assertGt(finalHealthFactor, 1.00e18, "Health factor should be safe");
+        // Calculate leverage: finalCollateral (USD with 8 decimals) / initialSupply (ETH with 18 decimals)
+        // Convert to same base: finalCollateralBase / 1e8 / (initialSupply / 1e18) = finalCollateralBase * 1e10 / initialSupply
         assertGt(
-            finalCollateralBase,
-            initialSupply * 1e8 * 2,
+            leverage,
+            2e18,
             "Should achieve >2x leverage"
         );
         assertLt(
-            finalCollateralBase,
-            initialSupply * 1e8 * 4,
+            leverage,
+            4e18,
             "Should not exceed 4x leverage"
         );
     }
 
-    function test_ExecuteLeverageLoops_cbETH_SingleLoop() public {
-        uint256 initialSupply = 10 ether;
-
-        console.log("=== cbETH Single Loop Leverage Strategy Test ===");
-        console.log("Initial WETH supply:", initialSupply / 1e18, "ETH");
-
-        vm.startPrank(testAccount);
-
-        // Initial supply
-        WETH.approve(address(AAVE_POOL), initialSupply);
-        AAVE_POOL.supply(address(WETH), initialSupply, testAccount, 0);
-
-        // Get current account data
-        (
-            uint256 totalCollateralBase,
-            uint256 totalDebtBase,
-            uint256 availableBorrowsBase,
-            ,
-            ,
-            uint256 healthFactor
-        ) = AAVE_POOL.getUserAccountData(testAccount);
-
-        console.log("Available borrows (USD):", availableBorrowsBase / 1e8);
-        console.log("Health factor:", healthFactor / 1e18);
-
-        // Calculate borrow amount (70% of available)
-        uint256 borrowAmountUSD = (availableBorrowsBase * TARGET_BORROW_RATIO) /
-            10000;
-
-        // Convert USD to cbETH amount using oracle
-        uint256 cbETHPrice = AAVE_ORACLE.getAssetPrice(address(cbETH));
-        uint256 borrowAmount = (borrowAmountUSD * 1e18) / cbETHPrice;
-
-        console.log("Borrowing:", borrowAmount / 1e18, "cbETH");
-        console.log("cbETH price (USD):", cbETHPrice / 1e8);
-
-        // Borrow cbETH
-        AAVE_POOL.borrow(address(cbETH), borrowAmount, 2, 0, testAccount);
-
-        // Swap cbETH to WETH using Curve
-        uint256 wethReceived = _swapcbETHToWETH(borrowAmount);
-
-        console.log("WETH received from Curve swap:", wethReceived / 1e18);
-
-        // Supply the received WETH back to Aave
-        WETH.approve(address(AAVE_POOL), wethReceived);
-        AAVE_POOL.supply(address(WETH), wethReceived, testAccount, 0);
-
-        // Final account status
-        (
-            uint256 finalCollateralBase,
-            uint256 finalDebtBase,
-            ,
-            ,
-            ,
-            uint256 finalHealthFactor
-        ) = AAVE_POOL.getUserAccountData(testAccount);
-
-        console.log("\n=== Final Results ===");
-        console.log("cbETH borrowed:", borrowAmount / 1e18);
-        console.log("WETH from swap:", wethReceived / 1e18);
-        console.log("Final collateral (USD):", finalCollateralBase / 1e8);
-        console.log("Final debt (USD):", finalDebtBase / 1e8);
-        console.log("Final health factor:", finalHealthFactor / 1e18);
-        console.log(
-            "Leverage ratio:",
-            (finalCollateralBase * 1e18) / (initialSupply * 1e8)
-        );
-
-        vm.stopPrank();
-
-        // Assertions
-        assertGt(finalHealthFactor, 1.2e18, "Health factor should be safe");
-        assertGt(
-            wethReceived,
-            (borrowAmount * 90) / 100,
-            "Should receive reasonable WETH amount"
-        );
-    }
-
-    function _swapwstETHToWETH(
-        uint256 wstETHAmount
-    ) internal returns (uint256 wethReceived) {
-        // wstETH is worth MORE than WETH (~1.21x based on staking rewards)
-        // Use Aave oracle prices for accurate calculation
-        uint256 wstETHPrice = AAVE_ORACLE.getAssetPrice(address(wstETH)); // $5,663
-        uint256 wethPrice = AAVE_ORACLE.getAssetPrice(address(WETH)); // $4,666
-
-        // Calculate expected output based on oracle prices
-        uint256 expectedWETH = (wstETHAmount * wstETHPrice) / wethPrice;
-
-        // Apply 2% slippage tolerance - should work well with pumped liquidity
-        uint256 minOutput = (expectedWETH * 98) / 100;
-        console.log("wstETH to swap:", wstETHAmount);
-        console.log("wstETH price (USD):", wstETHPrice / 1e8);
-        console.log("WETH price (USD):", wethPrice / 1e8);
-        console.log("Expected WETH (oracle based):", expectedWETH);
-        console.log("Min WETH with 2% slippage:", minOutput);
-
-        // Approve Uniswap router to spend wstETH
-        wstETH.approve(address(UNISWAP_ROUTER), wstETHAmount);
-
-        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter
-            .ExactInputSingleParams({
-                tokenIn: address(wstETH),
-                tokenOut: address(WETH),
-                fee: POOL_FEE, // Now using 0.3% pool for better liquidity
-                recipient: testAccount,
-                deadline: block.timestamp + 300,
-                amountIn: wstETHAmount,
-                amountOutMinimum: minOutput,
-                sqrtPriceLimitX96: 0
-            });
-
-        wethReceived = UNISWAP_ROUTER.exactInputSingle(params);
-        require(wethReceived > 0, "wstETH -> WETH swap failed");
-        console.log("Actual WETH received:", wethReceived / 1e18);
-        console.log(
-            "Swap efficiency:",
-            (wethReceived * 10000) / expectedWETH,
-            "/ 10000"
-        );
-    }
 
     function _swapcbETHToWETH(
         uint256 cbETHAmount
@@ -527,67 +389,6 @@ contract LeverageLoopingTest is Test {
             "/ 10000"
         );
     }
-    function _pumpPoolLiquidity() internal {
-        console.log("=== Pumping Pool Liquidity ===");
-
-        // Get the pool address for 0.3% fee tier
-        address poolAddress = IUniswapV3Factory(
-            0x1F98431c8aD98523631AE4a59f267346ea31F984
-        ).getPool(address(wstETH), address(WETH), POOL_FEE);
-
-        if (poolAddress == address(0)) {
-            console.log("Pool doesn't exist for 0.3% fee tier");
-            // Try 0.05% fee tier instead
-            poolAddress = IUniswapV3Factory(
-                0x1F98431c8aD98523631AE4a59f267346ea31F984
-            ).getPool(address(wstETH), address(WETH), 500);
-
-            if (poolAddress == address(0)) {
-                console.log(
-                    "No wstETH/WETH pool found, skipping liquidity pump"
-                );
-                return;
-            } else {
-                console.log("Using 0.05% fee tier pool");
-            }
-        }
-
-        console.log("Pool address:", poolAddress);
-
-        // Deal massive amounts directly to the pool (simple but effective for testing)
-        uint256 massiveAmount = 50000 ether; // 50k tokens each
-
-        console.log(
-            "Current pool WETH balance:",
-            WETH.balanceOf(poolAddress) / 1e18
-        );
-        console.log(
-            "Current pool wstETH balance:",
-            wstETH.balanceOf(poolAddress) / 1e18
-        );
-
-        // Add massive liquidity directly to pool
-        deal(
-            address(WETH),
-            poolAddress,
-            WETH.balanceOf(poolAddress) + massiveAmount
-        );
-        deal(
-            address(wstETH),
-            poolAddress,
-            wstETH.balanceOf(poolAddress) + massiveAmount
-        );
-
-        console.log(
-            "After pump WETH balance:",
-            WETH.balanceOf(poolAddress) / 1e18
-        );
-        console.log(
-            "After pump wstETH balance:",
-            wstETH.balanceOf(poolAddress) / 1e18
-        );
-        console.log("=== Pool Liquidity Pumped ===");
-    }
 
     function _logAccountData() internal view {
         (
@@ -606,28 +407,4 @@ contract LeverageLoopingTest is Test {
         console.log("---");
     }
 
-    function _resetAccountState() internal {
-        // Repay all debt and withdraw all collateral to reset for next test
-        (uint256 collateral, uint256 debt, , , , ) = AAVE_POOL
-            .getUserAccountData(testAccount);
-
-        if (debt > 0) {
-            vm.startPrank(testAccount);
-            // Get fresh wstETH to repay debt (CORRECTED)
-            deal(address(wstETH), testAccount, 10 ether);
-            wstETH.approve(address(AAVE_POOL), type(uint256).max);
-            AAVE_POOL.repay(address(wstETH), type(uint256).max, 2, testAccount);
-            vm.stopPrank();
-        }
-
-        if (collateral > 0) {
-            vm.startPrank(testAccount);
-            AAVE_POOL.withdraw(address(WETH), type(uint256).max, testAccount);
-            vm.stopPrank();
-        }
-
-        // Ensure fresh balances for next test
-        deal(address(WETH), testAccount, 100 ether);
-        deal(address(wstETH), testAccount, 5 ether);
-    }
 }

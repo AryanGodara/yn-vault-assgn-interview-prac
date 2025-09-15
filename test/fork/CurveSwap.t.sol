@@ -3,12 +3,20 @@ pragma solidity ^0.8.24;
 
 import {Test, console} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
 interface ICurvePool {
     // Crypto pool interface (cbETH/WETH uses uint256 parameters)
-    function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy) external returns (uint256);
-    function get_dy(uint256 i, uint256 j, uint256 dx) external view returns (uint256);
+    function exchange(
+        uint256 i,
+        uint256 j,
+        uint256 dx,
+        uint256 min_dy
+    ) external returns (uint256);
+    function get_dy(
+        uint256 i,
+        uint256 j,
+        uint256 dx
+    ) external view returns (uint256);
     function coins(uint256 i) external view returns (address);
 }
 
@@ -17,18 +25,15 @@ interface ICurvePool {
  * @notice Tests cbETH to WETH swapping via Curve pools for leverage looping strategy
  */
 contract CurveSwapTest is Test {
-    // ============ Token Addresses ============
     IERC20 public constant WETH =
         IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
     IERC20 public constant cbETH =
         IERC20(0xBe9895146f7AF43049ca1c1AE358B0541Ea49704);
 
-    // ============ Curve Pool Addresses ============
     // cbETH/ETH Curve pool (the main one with good liquidity)
     ICurvePool public constant CURVE_CBETH_ETH_POOL =
         ICurvePool(0x5FAE7E604FC3e24fd43A72867ceBaC94c65b404A);
 
-    // ============ Test Setup ============
     address public testAccount = makeAddr("testAccount");
     uint256 public forkId;
 
@@ -42,20 +47,6 @@ contract CurveSwapTest is Test {
         // Fund test account with WETH and cbETH
         deal(address(WETH), testAccount, 100 ether);
         deal(address(cbETH), testAccount, 100 ether);
-
-        console.log("=== Curve cbETH/WETH Swap Test Setup ===");
-        console.log("Block number:", block.number);
-        console.log("Chain ID:", block.chainid);
-        console.log(
-            "Test account WETH balance:",
-            WETH.balanceOf(testAccount) / 1e18,
-            "ETH"
-        );
-        console.log(
-            "Test account cbETH balance:",
-            cbETH.balanceOf(testAccount) / 1e18,
-            "cbETH"
-        );
     }
 
     function test_CurvePoolInfo() public view {
@@ -73,8 +64,6 @@ contract CurveSwapTest is Test {
 
         // Based on the addresses, determine indices
         // Token 0 = WETH, Token 1 = cbETH
-        console.log("WETH index: 0");
-        console.log("cbETH index: 1");
     }
 
     function test_CbETHToWETHSwap_Simple() public {
@@ -99,26 +88,13 @@ contract CurveSwapTest is Test {
 
         // Approve and swap
         cbETH.approve(address(CURVE_CBETH_ETH_POOL), type(uint256).max);
-        console.log("Approved cbETH for pool");
 
         // Try the exact pattern from your image: exchange(1, 0, amount, min_dy)
         try CURVE_CBETH_ETH_POOL.exchange(1, 0, swapAmount, minOutput) returns (
             uint256 wethReceived
         ) {
-            console.log("Swap successful! WETH received:", wethReceived, "wei");
-            console.log(
-                "Exchange rate:",
-                (wethReceived * 1e18) / swapAmount,
-                "WETH per cbETH (scaled by 1e18)"
-            );
-
             uint256 finalWETH = WETH.balanceOf(testAccount);
             uint256 finalCbETH = cbETH.balanceOf(testAccount);
-
-            console.log("Final WETH balance:", finalWETH / 1e18);
-            console.log("Final cbETH balance:", finalCbETH / 1e18);
-            console.log("WETH gained:", (finalWETH - initialWETH) / 1e18);
-            console.log("cbETH spent:", (initialCbETH - finalCbETH) / 1e18);
 
             assertGt(wethReceived, 0, "Should receive some WETH");
             assertEq(
@@ -148,9 +124,6 @@ contract CurveSwapTest is Test {
 
         vm.startPrank(testAccount);
 
-        console.log("=== Small cbETH -> WETH Swap Test ===");
-        console.log("Swapping:", swapAmount / 1e18, "cbETH");
-
         uint256 wethReceived = _swapCbETHToWETH(swapAmount);
 
         console.log("WETH received:", wethReceived / 1e18, "ETH");
@@ -175,30 +148,29 @@ contract CurveSwapTest is Test {
 
         vm.startPrank(testAccount);
 
-        console.log("=== Large cbETH -> WETH Swap Test ===");
-        console.log("Swapping:", swapAmount / 1e18, "cbETH");
-
         uint256 wethReceived = _swapCbETHToWETH(swapAmount);
 
         console.log("WETH received:", wethReceived / 1e18, "ETH");
-        console.log(
-            "Exchange rate:",
-            (wethReceived * 10000) / swapAmount,
-            "/ 10000"
-        );
-        console.log(
-            "Slippage:",
-            10000 - (wethReceived * 10000) / swapAmount,
-            "bps"
-        );
+        uint256 exchangeRate = (wethReceived * 10000) / swapAmount;
+        console.log("Exchange rate:", exchangeRate, "/ 10000");
+        
+        // cbETH is worth more than WETH, so we expect exchangeRate > 10000
+        if (exchangeRate > 10000) {
+            uint256 premium = exchangeRate - 10000;
+            console.log("cbETH premium:", premium, "bps");
+        } else {
+            uint256 discount = 10000 - exchangeRate;
+            console.log("cbETH discount:", discount, "bps");
+        }
 
         vm.stopPrank();
 
         assertGt(wethReceived, 0, "Should receive WETH");
+        // Since cbETH is worth more than WETH, we should receive more WETH than cbETH input
         assertGt(
             wethReceived,
-            (swapAmount * 85) / 100,
-            "Should receive >85% of input"
+            swapAmount,
+            "Should receive more WETH than cbETH input (cbETH premium)"
         );
     }
 
@@ -206,9 +178,6 @@ contract CurveSwapTest is Test {
         uint256 swapAmount = 5 ether; // 5 WETH
 
         vm.startPrank(testAccount);
-
-        console.log("=== WETH -> cbETH Swap Test ===");
-        console.log("Swapping:", swapAmount / 1e18, "WETH");
 
         uint256 cbETHReceived = _swapWETHToCbETH(swapAmount);
 
@@ -222,10 +191,11 @@ contract CurveSwapTest is Test {
         vm.stopPrank();
 
         assertGt(cbETHReceived, 0, "Should receive cbETH");
+        // When swapping WETH→cbETH, we should receive less cbETH than WETH input (cbETH is more valuable)
         assertGt(
             cbETHReceived,
-            (swapAmount * 90) / 100,
-            "Should receive >90% of input"
+            (swapAmount * 80) / 100,
+            "Should receive >80% of WETH input in cbETH"
         );
     }
 
@@ -265,16 +235,9 @@ contract CurveSwapTest is Test {
         uint256 cbETHAmount
     ) internal returns (uint256 wethReceived) {
         // Get expected output from Curve
-        uint256 expectedWETH = CURVE_CBETH_ETH_POOL.get_dy(
-            1,
-            0,
-            cbETHAmount
-        ); // cbETH=1, WETH=0
-        console.log("Expected WETH from Curve:", expectedWETH / 1e18);
-
+        uint256 expectedWETH = CURVE_CBETH_ETH_POOL.get_dy(1, 0, cbETHAmount); // cbETH=1, WETH=0
         // Apply 10% slippage tolerance (90% target)
         uint256 minOutput = (expectedWETH * 90) / 100;
-        console.log("Min WETH with 10% slippage:", minOutput / 1e18);
 
         // Approve Curve pool to spend cbETH
         cbETH.approve(address(CURVE_CBETH_ETH_POOL), cbETHAmount);
@@ -288,28 +251,15 @@ contract CurveSwapTest is Test {
         );
 
         require(wethReceived > 0, "cbETH -> WETH swap failed");
-        console.log("Actual WETH received:", wethReceived / 1e18);
-        console.log(
-            "Swap efficiency:",
-            (wethReceived * 10000) / expectedWETH,
-            "/ 10000"
-        );
     }
 
     function _swapWETHToCbETH(
         uint256 wethAmount
     ) internal returns (uint256 cbETHReceived) {
         // Get expected output from Curve
-        uint256 expectedCbETH = CURVE_CBETH_ETH_POOL.get_dy(
-            0,
-            1,
-            wethAmount
-        ); // WETH=0, cbETH=1
-        console.log("Expected cbETH from Curve:", expectedCbETH / 1e18);
-
+        uint256 expectedCbETH = CURVE_CBETH_ETH_POOL.get_dy(0, 1, wethAmount); // WETH=0, cbETH=1
         // Apply 10% slippage tolerance (90% target)
         uint256 minOutput = (expectedCbETH * 90) / 100;
-        console.log("Min cbETH with 10% slippage:", minOutput / 1e18);
 
         // Approve Curve pool to spend WETH
         WETH.approve(address(CURVE_CBETH_ETH_POOL), wethAmount);
@@ -323,11 +273,5 @@ contract CurveSwapTest is Test {
         );
 
         require(cbETHReceived > 0, "WETH -> cbETH swap failed");
-        console.log("Actual cbETH received:", cbETHReceived / 1e18);
-        console.log(
-            "Swap efficiency:",
-            (cbETHReceived * 10000) / expectedCbETH,
-            "/ 10000"
-        );
     }
 }

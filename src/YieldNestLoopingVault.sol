@@ -42,18 +42,15 @@ contract YieldNestLoopingVault is BaseVault {
 
     /// @notice Role for emergency operations
     bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
-
-    // ============ Protocol Integrations ============
     IPool public constant AAVE_POOL =
-        IPool(0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2); // Ethereum Aave V3
+        IPool(0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2);
     IAaveOracle public constant AAVE_ORACLE =
-        IAaveOracle(0x54586bE62E3c3580375aE3723C145253060Ca0C2); // Ethereum Aave Oracle
+        IAaveOracle(0x54586bE62E3c3580375aE3723C145253060Ca0C2);
     ICurvePool public constant CURVE_CBETH_ETH_POOL =
-        ICurvePool(0x5FAE7E604FC3e24fd43A72867ceBaC94c65b404A); // Curve cbETH/WETH pool
+        ICurvePool(0x5FAE7E604FC3e24fd43A72867ceBaC94c65b404A);
 
-    // ============ Assets ============
     IERC20 public constant WETH =
-        IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2); // Ethereum WETH
+        IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
     IERC20 public constant cbETH =
         IERC20(0xBe9895146f7AF43049ca1c1AE358B0541Ea49704); // Ethereum cbETH
 
@@ -72,7 +69,6 @@ contract YieldNestLoopingVault is BaseVault {
         uint256 totalDebt; // Total cbETH borrowed from Aave
     }
 
-    // ============ Events ============
     event LeverageExecuted(
         uint256 initialAmount,
         uint256 finalCollateral,
@@ -91,7 +87,6 @@ contract YieldNestLoopingVault is BaseVault {
     );
     event EmergencyDeleveraged(uint256 collateralWithdrawn, uint256 debtRepaid);
 
-    // ============ Errors ============
     error HealthFactorTooLow(uint256 healthFactor);
     error InvalidLeverageParameters();
     error SwapFailed();
@@ -150,13 +145,13 @@ contract YieldNestLoopingVault is BaseVault {
     ) public virtual override onlyAllocator returns (uint256 shares) {
         // Call parent deposit which handles the standard ERC4626 logic
         shares = super.deposit(assets, receiver);
-        
+
         // Execute leverage loops if enabled
         LoopingStorage storage loopingStorage = _getLoopingStorage();
         if (loopingStorage.syncDeposit) {
             _executeLeverageLoops(assets);
         }
-        
+
         return shares;
     }
 
@@ -177,7 +172,7 @@ contract YieldNestLoopingVault is BaseVault {
         if (loopingStorage.syncWithdraw) {
             _unwindPosition(assets);
         }
-        
+
         // Call parent withdraw which handles the standard ERC4626 logic
         return super.withdraw(assets, receiver, owner);
     }
@@ -196,13 +191,13 @@ contract YieldNestLoopingVault is BaseVault {
     ) public virtual override onlyAllocator returns (uint256 assets) {
         // Calculate assets to withdraw
         assets = previewRedeem(shares);
-        
+
         // Unwind leveraged position if enabled
         LoopingStorage storage loopingStorage = _getLoopingStorage();
         if (loopingStorage.syncWithdraw) {
             _unwindPosition(assets);
         }
-        
+
         // Call parent redeem which handles the standard ERC4626 logic
         return super.redeem(shares, receiver, owner);
     }
@@ -212,10 +207,10 @@ contract YieldNestLoopingVault is BaseVault {
      */
     function maxWithdraw(address owner) public view override returns (uint256) {
         if (paused()) return 0;
-        
+
         uint256 shares = balanceOf(owner);
         if (shares == 0) return 0;
-        
+
         // For leveraged vault, we can withdraw by unwinding positions
         // Return the theoretical max based on share value
         return previewRedeem(shares);
@@ -226,7 +221,7 @@ contract YieldNestLoopingVault is BaseVault {
      */
     function maxRedeem(address owner) public view override returns (uint256) {
         if (paused()) return 0;
-        
+
         uint256 shares = balanceOf(owner);
         return shares;
     }
@@ -241,19 +236,22 @@ contract YieldNestLoopingVault is BaseVault {
     /**
      * @notice Override _withdraw to handle our custom withdrawal logic
      */
-    function _withdraw(address caller, address receiver, address owner, uint256 assets, uint256 shares)
-        internal
-        override
-    {
+    function _withdraw(
+        address caller,
+        address receiver,
+        address owner,
+        uint256 assets,
+        uint256 shares
+    ) internal override {
         // Check actual WETH balance and adjust if necessary
         uint256 actualWETHBalance = WETH.balanceOf(address(this));
         uint256 actualAssets = assets;
-        
+
         if (actualWETHBalance < assets) {
             // If we don't have enough WETH, transfer what we have
             actualAssets = actualWETHBalance;
         }
-        
+
         _subTotalAssets(_convertAssetToBase(asset(), actualAssets));
         if (caller != owner) {
             _spendAllowance(owner, caller, shares);
@@ -269,7 +267,6 @@ contract YieldNestLoopingVault is BaseVault {
 
         emit Withdraw(caller, receiver, owner, actualAssets, shares);
     }
-
 
     /**
      * @notice Execute leveraged looping strategy
@@ -339,7 +336,8 @@ contract YieldNestLoopingVault is BaseVault {
 
         // Check if this is a full withdrawal (close to total vault value)
         uint256 totalVaultValue = _getTotalValue();
-        bool isFullWithdrawal = targetWithdrawAmount >= (totalVaultValue * 95) / 100; // 95% threshold
+        bool isFullWithdrawal = targetWithdrawAmount >=
+            (totalVaultValue * 95) / 100; // 95% threshold
 
         uint256 totalCollateralWithdrawn = 0;
         uint256 totalDebtRepaid = 0;
@@ -372,44 +370,66 @@ contract YieldNestLoopingVault is BaseVault {
         // Repay all debt iteratively using actual debt token balance
         uint256 iterations = 0;
         uint256 maxIterations = 15; // Increased safety limit
-        
+
         while (iterations < maxIterations) {
             iterations++;
-            
+
             // Get current debt from Aave (this is the actual debt balance)
-            (, uint256 totalDebtUSD, , , , ) = AAVE_POOL.getUserAccountData(address(this));
+            (, uint256 totalDebtUSD, , , , ) = AAVE_POOL.getUserAccountData(
+                address(this)
+            );
             if (totalDebtUSD < 1e6) break; // Less than $1 USD debt, consider it zero
-            
+
             // Get cbETH price to convert USD debt to cbETH amount
             uint256 cbETHPrice = AAVE_ORACLE.getAssetPrice(address(cbETH));
             uint256 debtInCbETH = (totalDebtUSD * 1e18) / cbETHPrice; // Convert to cbETH amount
-            
+
             if (debtInCbETH < 1e15) break; // Less than 0.001 cbETH
-            
+
             // Calculate WETH needed to get enough cbETH (with generous buffer)
             uint256 wethNeeded = (debtInCbETH * 11000) / 10000; // 110% of debt in WETH terms
-            
+
             // Try to withdraw WETH collateral
-            try AAVE_POOL.withdraw(address(WETH), wethNeeded, address(this)) returns (uint256 withdrawn) {
+            try
+                AAVE_POOL.withdraw(address(WETH), wethNeeded, address(this))
+            returns (uint256 withdrawn) {
                 if (withdrawn == 0) break;
-                
+
                 // Swap WETH to cbETH to repay debt
                 uint256 cbETHReceived = _swapWETHTocbETH(withdrawn);
-                
+
                 // Repay all available cbETH debt
                 if (cbETHReceived > 0) {
                     cbETH.forceApprove(address(AAVE_POOL), cbETHReceived);
-                    AAVE_POOL.repay(address(cbETH), type(uint256).max, 2, address(this));
+                    AAVE_POOL.repay(
+                        address(cbETH),
+                        type(uint256).max,
+                        2,
+                        address(this)
+                    );
                 }
-                
             } catch {
                 // If withdrawal fails, try with 50% of the amount
-                try AAVE_POOL.withdraw(address(WETH), wethNeeded / 2, address(this)) returns (uint256 withdrawn) {
+                try
+                    AAVE_POOL.withdraw(
+                        address(WETH),
+                        wethNeeded / 2,
+                        address(this)
+                    )
+                returns (uint256 withdrawn) {
                     if (withdrawn > 0) {
                         uint256 cbETHReceived = _swapWETHTocbETH(withdrawn);
                         if (cbETHReceived > 0) {
-                            cbETH.forceApprove(address(AAVE_POOL), cbETHReceived);
-                            AAVE_POOL.repay(address(cbETH), type(uint256).max, 2, address(this));
+                            cbETH.forceApprove(
+                                address(AAVE_POOL),
+                                cbETHReceived
+                            );
+                            AAVE_POOL.repay(
+                                address(cbETH),
+                                type(uint256).max,
+                                2,
+                                address(this)
+                            );
                         }
                     }
                 } catch {
@@ -418,9 +438,11 @@ contract YieldNestLoopingVault is BaseVault {
                 }
             }
         }
-        
+
         // Final cleanup: withdraw any remaining WETH collateral
-        try AAVE_POOL.withdraw(address(WETH), type(uint256).max, address(this)) {} catch {}
+        try
+            AAVE_POOL.withdraw(address(WETH), type(uint256).max, address(this))
+        {} catch {}
     }
 
     /**
@@ -446,42 +468,56 @@ contract YieldNestLoopingVault is BaseVault {
         // Unwind position iteratively until we have enough WETH
         uint256 iterations = 0;
         uint256 maxIterations = loopCount + 2; // Safety limit
-        
-        while (WETH.balanceOf(address(this)) < targetWithdrawAmount && iterations < maxIterations) {
+
+        while (
+            WETH.balanceOf(address(this)) < targetWithdrawAmount &&
+            iterations < maxIterations
+        ) {
             iterations++;
-            
+
             // Calculate how much debt to repay (start with smaller amounts)
-            uint256 debtToRepay = currentDebt / (maxIterations - iterations + 1);
+            uint256 debtToRepay = currentDebt /
+                (maxIterations - iterations + 1);
             if (debtToRepay == 0) debtToRepay = 1e15; // Minimum 0.001 cbETH
-            
+
             // Calculate collateral to withdraw (with buffer for slippage)
             uint256 collateralToWithdraw = (debtToRepay * 12000) / 10000; // 120% buffer
-            
+
             // Ensure we don't withdraw more than available
-            try AAVE_POOL.withdraw(address(WETH), collateralToWithdraw, address(this)) returns (uint256 withdrawn) {
+            try
+                AAVE_POOL.withdraw(
+                    address(WETH),
+                    collateralToWithdraw,
+                    address(this)
+                )
+            returns (uint256 withdrawn) {
                 if (withdrawn == 0) break;
-                
+
                 // Swap only what's needed to repay debt
                 uint256 wethForSwap = withdrawn;
-                
+
                 // If we have more WETH than needed for debt repayment, keep some
                 if (withdrawn > debtToRepay) {
                     wethForSwap = debtToRepay;
                 }
-                
+
                 if (wethForSwap > 0) {
                     // Swap WETH to cbETH to repay debt
                     uint256 cbETHReceived = _swapWETHTocbETH(wethForSwap);
-                    
+
                     // Repay cbETH debt
                     if (cbETHReceived > 0) {
                         cbETH.forceApprove(address(AAVE_POOL), cbETHReceived);
-                        AAVE_POOL.repay(address(cbETH), cbETHReceived, 2, address(this));
+                        AAVE_POOL.repay(
+                            address(cbETH),
+                            cbETHReceived,
+                            2,
+                            address(this)
+                        );
                     }
                 }
-                
+
                 currentDebt = cbETH.balanceOf(address(this));
-                
             } catch {
                 // If withdrawal fails, try with smaller amount
                 collateralToWithdraw = collateralToWithdraw / 2;
@@ -601,7 +637,8 @@ contract YieldNestLoopingVault is BaseVault {
         uint256 wethBalance = WETH.balanceOf(address(this));
 
         // Get Aave position data directly
-        (uint256 totalCollateralETH, uint256 totalDebtETH, , , , ) = AAVE_POOL.getUserAccountData(address(this));
+        (uint256 totalCollateralETH, uint256 totalDebtETH, , , , ) = AAVE_POOL
+            .getUserAccountData(address(this));
 
         if (totalCollateralETH == 0) {
             return wethBalance; // No leveraged position
@@ -612,10 +649,12 @@ contract YieldNestLoopingVault is BaseVault {
         uint256 wethPrice = AAVE_ORACLE.getAssetPrice(address(WETH));
         uint256 collateralETH = (totalCollateralETH * 1e18) / wethPrice;
         uint256 debtETH = (totalDebtETH * 1e18) / wethPrice;
-        
+
         // Net equity = collateral - debt + direct WETH holdings
-        uint256 netEquity = collateralETH > debtETH ? collateralETH - debtETH : 0;
-            
+        uint256 netEquity = collateralETH > debtETH
+            ? collateralETH - debtETH
+            : 0;
+
         return netEquity + wethBalance;
     }
 
@@ -630,7 +669,6 @@ contract YieldNestLoopingVault is BaseVault {
         loopingStorage.totalCollateral = totalCollateralETH;
         loopingStorage.totalDebt = totalDebtETH;
     }
-
 
     /**
      * @notice Validate health factor is above minimum threshold
