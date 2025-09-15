@@ -18,8 +18,7 @@ import {ERC1967Proxy} from "openzeppelin/proxy/ERC1967/ERC1967Proxy.sol";
  */
 abstract contract BaseDeployScript is Script {
     /// Address of the multichain CREATE2 deterministic deployer (used by Foundry).
-    address public constant CREATE2_DEPLOYER =
-        0x4e59b44847b379578588920cA78FbF26c0B4956C;
+    address public constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
 
     /// @dev Identifies the deployment JSON to vm.serializeXXX and vm.writeJson functions.
     string internal constant DEPLOYMENT_JSON_KEY = "deployment_key";
@@ -52,23 +51,11 @@ abstract contract BaseDeployScript is Script {
      * the ABI map. Pass an empty string to signify no ABI mapping is desired.
      * @param deployedAddress The address of the deployed contract.
      */
-    function deployed(
-        string memory contractAlias,
-        string memory contractName,
-        address deployedAddress
-    ) internal {
+    function deployed(string memory contractAlias, string memory contractName, address deployedAddress) internal {
         if (output) {
-            deploymentJson = vm.serializeAddress(
-                DEPLOYMENT_JSON_KEY,
-                contractAlias,
-                deployedAddress
-            );
+            deploymentJson = vm.serializeAddress(DEPLOYMENT_JSON_KEY, contractAlias, deployedAddress);
             if (bytes(contractName).length > 0) {
-                abiMapJson = vm.serializeString(
-                    ABI_MAP_JSON_KEY,
-                    contractAlias,
-                    contractName
-                );
+                abiMapJson = vm.serializeString(ABI_MAP_JSON_KEY, contractAlias, contractName);
             }
         }
     }
@@ -77,10 +64,7 @@ abstract contract BaseDeployScript is Script {
      * Same as `deployed(string,string,address)` with the contract alias set to the
      * contract name.
      */
-    function deployed(
-        string memory contractName,
-        address deployedAddress
-    ) internal {
+    function deployed(string memory contractName, address deployedAddress) internal {
         deployed(contractName, contractName, deployedAddress);
     }
 
@@ -106,27 +90,14 @@ abstract contract BaseDeployScript is Script {
      * Returns the predicted address of a CREATE2 contract deployment using the CREATE2
      * deterministic deployer, given the entire creation code and a salt.
      */
-    function getCreate2Address(
-        bytes memory creationCode,
-        bytes32 salt
-    ) internal pure returns (address payable) {
-        return
-            payable(
-                address(
-                    uint160(
-                        uint256(
-                            keccak256(
-                                abi.encodePacked(
-                                    bytes1(0xff),
-                                    CREATE2_DEPLOYER,
-                                    salt,
-                                    keccak256(creationCode)
-                                )
-                            )
-                        )
-                    )
+    function getCreate2Address(bytes memory creationCode, bytes32 salt) internal pure returns (address payable) {
+        return payable(
+            address(
+                uint160(
+                    uint256(keccak256(abi.encodePacked(bytes1(0xff), CREATE2_DEPLOYER, salt, keccak256(creationCode))))
                 )
-            );
+            )
+        );
     }
 
     /**
@@ -134,40 +105,29 @@ abstract contract BaseDeployScript is Script {
      * deterministic deployer, given the creation code, the abi-encoded constructor arguments and a
      * salt.
      */
-    function getCreate2Address(
-        bytes memory creationCode,
-        bytes memory constructorArgs,
-        bytes32 salt
-    ) internal pure returns (address payable) {
-        return
-            getCreate2Address(
-                abi.encodePacked(creationCode, constructorArgs),
-                salt
-            );
+    function getCreate2Address(bytes memory creationCode, bytes memory constructorArgs, bytes32 salt)
+        internal
+        pure
+        returns (address payable)
+    {
+        return getCreate2Address(abi.encodePacked(creationCode, constructorArgs), salt);
     }
 
     /**
      * Returns the size of the given contract.
      */
-    function getContractSize(
-        address addr
-    ) internal view returns (uint256 size) {
+    function getContractSize(address addr) internal view returns (uint256 size) {
         assembly ("memory-safe") {
             size := extcodesize(addr)
         }
     }
 
-    function _deployDeterministicCreationCode(
-        bytes memory creationCode,
-        bytes32 salt
-    ) internal returns (address payable addr) {
+    function _deployDeterministicCreationCode(bytes memory creationCode, bytes32 salt)
+        internal
+        returns (address payable addr)
+    {
         assembly ("memory-safe") {
-            addr := create2(
-                0,
-                add(creationCode, 0x20),
-                mload(creationCode),
-                salt
-            )
+            addr := create2(0, add(creationCode, 0x20), mload(creationCode), salt)
         }
     }
 
@@ -189,27 +149,17 @@ abstract contract BaseDeployScript is Script {
         bytes memory constructorArgs,
         bytes32 salt
     ) internal returns (address payable, bool) {
-        address payable predictedAddress = getCreate2Address(
-            creationCode,
-            constructorArgs,
-            salt
-        );
+        address payable predictedAddress = getCreate2Address(creationCode, constructorArgs, salt);
 
         if (getContractSize(predictedAddress) > 0) {
-            if (output)
-                console.log(
-                    "Contract already deployed",
-                    contractAlias,
-                    predictedAddress
-                );
+            if (output) {
+                console.log("Contract already deployed", contractAlias, predictedAddress);
+            }
             deployed(contractAlias, contractName, predictedAddress);
             return (predictedAddress, false);
         }
 
-        address payable addr = _deployDeterministicCreationCode(
-            abi.encodePacked(creationCode, constructorArgs),
-            salt
-        );
+        address payable addr = _deployDeterministicCreationCode(abi.encodePacked(creationCode, constructorArgs), salt);
         if (addr == address(0)) {
             if (output) console.log("Deploy failed", contractAlias);
             revert("Deploy failed");
@@ -229,14 +179,7 @@ abstract contract BaseDeployScript is Script {
         bytes memory constructorArgs,
         bytes32 salt
     ) internal returns (address payable, bool) {
-        return
-            deployDeterministic(
-                contractName,
-                contractName,
-                creationCode,
-                constructorArgs,
-                salt
-            );
+        return deployDeterministic(contractName, contractName, creationCode, constructorArgs, salt);
     }
 
     /**
@@ -261,14 +204,9 @@ abstract contract BaseDeployScript is Script {
         bytes memory initData,
         bytes32 salt
     ) internal returns (address, bool) {
-        return
-            deployDeterministic(
-                contractAlias,
-                contractName,
-                type(ERC1967Proxy).creationCode,
-                abi.encode(implementation, initData),
-                salt
-            );
+        return deployDeterministic(
+            contractAlias, contractName, type(ERC1967Proxy).creationCode, abi.encode(implementation, initData), salt
+        );
     }
 
     /**
@@ -281,14 +219,9 @@ abstract contract BaseDeployScript is Script {
         bytes memory initData,
         bytes32 salt
     ) internal returns (address, bool) {
-        return
-            deployDeterministic(
-                contractAlias,
-                contractAlias,
-                type(ERC1967Proxy).creationCode,
-                abi.encode(implementation, initData),
-                salt
-            );
+        return deployDeterministic(
+            contractAlias, contractAlias, type(ERC1967Proxy).creationCode, abi.encode(implementation, initData), salt
+        );
     }
 
     /**

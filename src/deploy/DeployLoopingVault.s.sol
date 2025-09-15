@@ -138,31 +138,4 @@ contract DeployLoopingVault is BaseDeployScript {
         // Unpause the vault to make it ready for use
         vault.unpause();
     }
-
-    /// @dev Deployment for tests - simplified without configuration
-    function deployForTests() external {
-        // Determine owner address based on network
-        address owner = block.chainid == 84532 || block.chainid == 8453
-            ? 0x74637F06a8914beB5D00079681c48494FbccBdB9 // Base funded wallet (testnet + mainnet)
-            : 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266; // Anvil default account 0
-
-        // Deploy provider first
-        provider = new LoopingVaultProvider();
-
-        YieldNestLoopingVault implementation = new YieldNestLoopingVault();
-
-        // Deploy proxy with initialization
-        bytes memory initData = abi.encodeWithSelector(
-            YieldNestLoopingVault.initialize.selector,
-            owner,
-            VAULT_NAME,
-            VAULT_SYMBOL
-        );
-
-        ERC1967Proxy proxy = new ERC1967Proxy(
-            address(implementation),
-            initData
-        );
-        vault = YieldNestLoopingVault(payable(address(proxy)));
-    }
 }

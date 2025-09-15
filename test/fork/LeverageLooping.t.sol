@@ -325,15 +325,18 @@ contract LeverageLoopingTest is Test {
         uint256 wethPrice = AAVE_ORACLE.getAssetPrice(address(WETH)); // Price in USD with 8 decimals
         uint256 finalCollateralETH = (finalCollateralBase * 1e18) / wethPrice; // Convert to ETH with 18 decimals
         uint256 leverage = (finalCollateralETH * 1e18) / initialSupply; // Both in 18 decimals now
-        
-        console.log("Debug - finalCollateralBase (USD):", finalCollateralBase / 1e8);
+
+        console.log(
+            "Debug - finalCollateralBase (USD):",
+            finalCollateralBase / 1e8
+        );
         console.log("Debug - WETH price (USD):", wethPrice / 1e8);
         console.log("Debug - finalCollateralETH:", finalCollateralETH / 1e18);
         console.log("Debug - initialSupply (ETH):", initialSupply / 1e18);
         console.log("Debug - leverage raw:", leverage);
         console.log(
             "Effective leverage:",
-            leverage / 1e15  // Show with 3 decimal places
+            leverage / 1e15 // Show with 3 decimal places
         );
 
         vm.stopPrank();
@@ -342,18 +345,9 @@ contract LeverageLoopingTest is Test {
         assertGt(finalHealthFactor, 1.00e18, "Health factor should be safe");
         // Calculate leverage: finalCollateral (USD with 8 decimals) / initialSupply (ETH with 18 decimals)
         // Convert to same base: finalCollateralBase / 1e8 / (initialSupply / 1e18) = finalCollateralBase * 1e10 / initialSupply
-        assertGt(
-            leverage,
-            2e18,
-            "Should achieve >2x leverage"
-        );
-        assertLt(
-            leverage,
-            4e18,
-            "Should not exceed 4x leverage"
-        );
+        assertGt(leverage, 2e18, "Should achieve >2x leverage");
+        assertLt(leverage, 4e18, "Should not exceed 4x leverage");
     }
-
 
     function _swapcbETHToWETH(
         uint256 cbETHAmount
@@ -406,5 +400,4 @@ contract LeverageLoopingTest is Test {
         console.log("Health Factor:", (healthFactor * 100) / 1e18, "/ 100");
         console.log("---");
     }
-
 }

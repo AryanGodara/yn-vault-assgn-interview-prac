@@ -21,9 +21,7 @@ contract LoopingVaultProvider is IProvider {
      * @param asset The asset address
      * @return rate The conversion rate (18 decimals)
      */
-    function getRate(
-        address asset
-    ) external pure override returns (uint256 rate) {
+    function getRate(address asset) external pure override returns (uint256 rate) {
         if (asset == WETH || asset == cbETH) {
             // Return 1:1 rate since both assets have 18 decimals
             // The actual cbETH/WETH conversion is handled in the vault's swap logic
