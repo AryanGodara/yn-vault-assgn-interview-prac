@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
-import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import { ERC4626 } from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
-import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
-import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
-import { ReentrancyGuardTransient } from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
-import { IStrategy } from "src/interfaces/IStrategy.sol";
-import { VaultMath } from "src/libraries/VaultMath.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
+import {VaultMath} from "./libraries/VaultMath.sol";
 
 /**
  * @title VaultCore
- * @notice ERC4626 tokenized vault with Aave V3 yield generation
+ * @notice ERC4626 tokenized vault with WETH leveraged looping strategy
  * @dev This vault implements multiple security layers and gas optimizations
  *
  * Key Design Decisions:
@@ -22,6 +22,7 @@ import { VaultMath } from "src/libraries/VaultMath.sol";
  * 2. Modular strategy pattern for upgradability
  * 3. Time-delayed strategy updates for security
  * 4. Emergency mechanisms with role-based access
+ * 5. WETH-based looping strategy for enhanced yields
  */
 contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
     using SafeERC20 for IERC20;
@@ -62,7 +63,7 @@ contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
 
     // Security limits
     uint256 public maxDeposit_ = type(uint256).max;
-    uint256 public maxWithdrawPerBlock = 1_000_000e6; // 1M USDC per block
+    uint256 public maxWithdrawPerBlock = 1_000e18; // 1000 WETH per block
     mapping(uint256 => uint256) public blockWithdrawals;
 
     // Treasury address for fee collection
@@ -73,9 +74,16 @@ contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
     //////////////////////////////////////////////////////////////*/
 
     event StrategyProposed(address indexed newStrategy, uint256 activationTime);
-    event StrategyUpdated(address indexed oldStrategy, address indexed newStrategy);
+    event StrategyUpdated(
+        address indexed oldStrategy,
+        address indexed newStrategy
+    );
     event StrategyInitialized(address indexed strategy);
-    event HarvestCompleted(uint256 profit, uint256 loss, uint256 performanceFee);
+    event HarvestCompleted(
+        uint256 profit,
+        uint256 loss,
+        uint256 performanceFee
+    );
     event FeesUpdated(uint256 performanceFee, uint256 managementFee);
     event EmergencyShutdown(address indexed caller);
 
@@ -97,17 +105,18 @@ contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
 
     /**
      * @notice Initializes the vault with the given asset
-     * @param _asset The ERC20 token to use as the vault's asset (USDC)
+     * @param _asset The ERC20 token to use as the vault's asset (WETH)
      * @param _name Name of the vault token
      * @param _symbol Symbol of the vault token
      * @param _owner The initial owner of the vault
      * @dev Strategy will be set via initStrategy() after deployment
      */
-    constructor(IERC20 _asset, string memory _name, string memory _symbol, address _owner)
-        ERC4626(_asset)
-        ERC20(_name, _symbol)
-        Ownable(_owner)
-    {
+    constructor(
+        IERC20 _asset,
+        string memory _name,
+        string memory _symbol,
+        address _owner
+    ) ERC4626(_asset) ERC20(_name, _symbol) Ownable(_owner) {
         // Initialize harvest tracking
         lastHarvest = block.timestamp;
 
@@ -144,7 +153,10 @@ contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
      * @return shares Amount of shares minted
      * @dev Includes reentrancy protection and strategy allocation
      */
-    function deposit(uint256 assets, address receiver)
+    function deposit(
+        uint256 assets,
+        address receiver
+    )
         public
         virtual
         override
@@ -174,7 +186,11 @@ contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
      * @return shares Amount of shares burned
      * @dev Includes withdrawal limit checks and strategy unwinding
      */
-    function withdraw(uint256 assets, address receiver, address owner)
+    function withdraw(
+        uint256 assets,
+        address receiver,
+        address owner
+    )
         public
         virtual
         override
@@ -201,7 +217,11 @@ contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
      * @param owner Address whose shares are being redeemed
      * @return assets Amount of assets withdrawn
      */
-    function redeem(uint256 shares, address receiver, address owner)
+    function redeem(
+        uint256 shares,
+        address receiver,
+        address owner
+    )
         public
         virtual
         override
@@ -234,7 +254,9 @@ contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
      */
     function totalAssets() public view virtual override returns (uint256) {
         uint256 vaultBalance = IERC20(asset()).balanceOf(address(this));
-        uint256 strategyBalance = address(strategy) != address(0) ? strategy.totalAssets() : 0;
+        uint256 strategyBalance = address(strategy) != address(0)
+            ? strategy.totalAssets()
+            : 0;
         return vaultBalance + strategyBalance;
     }
 
@@ -372,19 +394,31 @@ contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
 
         if (profit > 0) {
             // Performance fee on profit
-            performanceFeeAmount = profit.mulDiv(performanceFee, MAX_BPS, Math.Rounding.Floor);
+            performanceFeeAmount = profit.mulDiv(
+                performanceFee,
+                MAX_BPS,
+                Math.Rounding.Floor
+            );
         }
 
         // Management fee calculation (annual rate adjusted for time passed)
         uint256 timePassed = block.timestamp - lastHarvest;
         uint256 avgAssets = (lastTotalAssets + currentAssets) / 2;
-        managementFeeAmount = avgAssets.mulDiv(managementFee * timePassed, MAX_BPS * 365 days, Math.Rounding.Floor);
+        managementFeeAmount = avgAssets.mulDiv(
+            managementFee * timePassed,
+            MAX_BPS * 365 days,
+            Math.Rounding.Floor
+        );
 
         // Mint fee shares to treasury
         uint256 totalFees = performanceFeeAmount + managementFeeAmount;
         if (totalFees > 0) {
             // Use enhanced VaultMath for precise fee share calculation
-            uint256 feeShares = VaultMath.calculateFeeShares(totalFees, totalSupply(), currentAssets);
+            uint256 feeShares = VaultMath.calculateFeeShares(
+                totalFees,
+                totalSupply(),
+                currentAssets
+            );
             // Mint fee shares to treasury
             _mint(treasury, feeShares);
         }
@@ -433,7 +467,9 @@ contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
      * @notice Returns maximum deposit amount for a receiver
      * @return Maximum deposit amount
      */
-    function maxDeposit(address /* receiver */ ) public view virtual override returns (uint256) {
+    function maxDeposit(
+        address /* receiver */
+    ) public view virtual override returns (uint256) {
         if (paused()) return 0;
         return maxDeposit_;
     }
@@ -442,9 +478,17 @@ contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
      * @notice Returns maximum shares that can be minted to receiver
      * @return Maximum mintable shares
      */
-    function maxMint(address /* receiver */ ) public view virtual override returns (uint256) {
+    function maxMint(
+        address /* receiver */
+    ) public view virtual override returns (uint256) {
         if (paused()) return 0;
-        return VaultMath.convertToShares(maxDeposit_, totalSupply(), totalAssets(), false);
+        return
+            VaultMath.convertToShares(
+                maxDeposit_,
+                totalSupply(),
+                totalAssets(),
+                false
+            );
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -456,8 +500,14 @@ contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
      * @param _performanceFee New performance fee in basis points
      * @param _managementFee New management fee in basis points
      */
-    function setFees(uint128 _performanceFee, uint128 _managementFee) external onlyOwner {
-        if (_performanceFee > MAX_PERFORMANCE_FEE || _managementFee > MAX_MANAGEMENT_FEE) {
+    function setFees(
+        uint128 _performanceFee,
+        uint128 _managementFee
+    ) external onlyOwner {
+        if (
+            _performanceFee > MAX_PERFORMANCE_FEE ||
+            _managementFee > MAX_MANAGEMENT_FEE
+        ) {
             revert VaultCore__InvalidFee();
         }
 
@@ -509,7 +559,14 @@ contract VaultCore is ERC4626, ReentrancyGuardTransient, Pausable, Ownable {
      * @param targetRatio The ratio the attacker wants to achieve (scaled by 1e18)
      * @return attackCost Minimum assets needed for the attack
      */
-    function estimateInflationAttackCost(uint256 targetRatio) external view returns (uint256 attackCost) {
-        return VaultMath.estimateInflationAttackCost(targetRatio, totalSupply(), totalAssets());
+    function estimateInflationAttackCost(
+        uint256 targetRatio
+    ) external view returns (uint256 attackCost) {
+        return
+            VaultMath.estimateInflationAttackCost(
+                targetRatio,
+                totalSupply(),
+                totalAssets()
+            );
     }
 }

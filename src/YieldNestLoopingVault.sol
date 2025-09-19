@@ -39,9 +39,6 @@ contract YieldNestLoopingVault is BaseVault {
     /// @notice Role for strategy parameter management
     bytes32 public constant STRATEGY_MANAGER_ROLE =
         keccak256("STRATEGY_MANAGER_ROLE");
-
-    /// @notice Role for emergency operations
-    bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
     IPool public constant AAVE_POOL =
         IPool(0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2);
     IAaveOracle public constant AAVE_ORACLE =
@@ -60,13 +57,16 @@ contract YieldNestLoopingVault is BaseVault {
     uint256 public loopCount = 3; // Number of leverage loops (adjustable)
     uint256 public slippageTolerance = 1000; // 10% slippage tolerance for Curve (adjustable)
 
+    // ============ Virtual Shares for Inflation Protection ============
+    uint256 public constant DECIMAL_OFFSET = 3; // 1 asset = 1000 shares (10^3)
+
     // ============ Strategy Storage ============
     struct LoopingStorage {
         bool syncDeposit; // Whether to execute loops on deposit
         bool syncWithdraw; // Whether to unwind on withdraw
         bool hasAllocators; // Whether allocator restrictions are active
-        uint256 totalCollateral; // Total WETH supplied to Aave
-        uint256 totalDebt; // Total cbETH borrowed from Aave
+        uint256 totalCollateralUSD; // Total collateral value in USD (8 decimals)
+        uint256 totalDebtUSD; // Total debt value in USD (8 decimals)
     }
 
     event LeverageExecuted(
@@ -85,7 +85,6 @@ contract YieldNestLoopingVault is BaseVault {
         uint256 loopCount,
         uint256 slippageTolerance
     );
-    event EmergencyDeleveraged(uint256 collateralWithdrawn, uint256 debtRepaid);
 
     error HealthFactorTooLow(uint256 healthFactor);
     error InvalidLeverageParameters();
@@ -95,8 +94,67 @@ contract YieldNestLoopingVault is BaseVault {
     // State variables for looping strategy
     using SafeERC20 for IERC20;
 
-    // Track legitimate deposits to prevent donation attacks
-    uint256 private _totalDeposited;
+    // ============ Decimal Conversion Helpers ============
+
+    /**
+     * @notice Convert USD amount (8 decimals) to token amount (18 decimals)
+     * @param usdAmount Amount in USD with 8 decimals
+     * @param token Token address to get price for
+     * @return tokenAmount Amount in token with 18 decimals
+     */
+    function _convertUSDToTokenAmount(
+        uint256 usdAmount,
+        address token
+    ) internal view returns (uint256 tokenAmount) {
+        uint256 tokenPrice = AAVE_ORACLE.getAssetPrice(token);
+        // Aave prices are in USD with 8 decimals, convert to token amount with 18 decimals
+        return (usdAmount * 1e18) / tokenPrice;
+    }
+
+    /**
+     * @notice Convert token amount (18 decimals) to USD amount (8 decimals)
+     * @param tokenAmount Amount in token with 18 decimals
+     * @param token Token address to get price for
+     * @return usdAmount Amount in USD with 8 decimals
+     */
+    function _convertTokenAmountToUSD(
+        uint256 tokenAmount,
+        address token
+    ) internal view returns (uint256 usdAmount) {
+        uint256 tokenPrice = AAVE_ORACLE.getAssetPrice(token);
+        // Convert from 18 decimal token to 8 decimal USD
+        return (tokenAmount * tokenPrice) / 1e18;
+    }
+
+    /**
+     * @notice Convert assets to shares using virtual shares for inflation protection
+     * @param assets Amount of assets to convert
+     * @return shares Amount of shares (with virtual offset)
+     */
+    function _convertToShares(uint256 assets) internal view returns (uint256) {
+        // Use virtual shares logic for inflation protection
+        // totalAssets() includes leveraged Aave positions via _getTotalValue()
+        return
+            (assets * (totalSupply() + 10 ** DECIMAL_OFFSET)) /
+            (totalAssets() + 1);
+    }
+
+    /**
+     * @notice Convert shares to assets using virtual shares for inflation protection
+     * @param shares Amount of shares to convert
+     * @return assets Amount of assets
+     */
+    function _convertToAssets(uint256 shares) internal view returns (uint256) {
+        uint256 supply = totalSupply();
+
+        if (supply == 0) {
+            return shares / (10 ** DECIMAL_OFFSET);
+        } else {
+            return
+                (shares * (totalAssets() + 1)) /
+                (totalSupply() + 10 ** DECIMAL_OFFSET);
+        }
+    }
 
     /**
      * @notice Initialize the vault (must be called after deployment)
@@ -109,9 +167,6 @@ contract YieldNestLoopingVault is BaseVault {
         string memory name,
         string memory symbol
     ) external initializer {
-        // Initialize deposit tracking
-        _totalDeposited = 0;
-
         // Initialize the base vault
         _initialize(
             admin,
@@ -139,9 +194,8 @@ contract YieldNestLoopingVault is BaseVault {
         // Grant additional roles to admin
         _grantRole(ALLOCATOR_ROLE, admin);
         _grantRole(STRATEGY_MANAGER_ROLE, admin);
-        _grantRole(EMERGENCY_ROLE, admin);
 
-        // Note: Dead shares protection will be handled in the first deposit
+        // Note: Dead shares protection is handled in first deposit via virtual shares + dead share minting
     }
 
     /**
@@ -156,27 +210,18 @@ contract YieldNestLoopingVault is BaseVault {
     ) public virtual override onlyAllocator returns (uint256 shares) {
         require(assets > 0, "Cannot deposit 0");
 
-        // Calculate shares based on current vault state BEFORE deposit
         uint256 supply = totalSupply();
-
+        
+        // First deposit: mint dead shares for belt-and-suspenders protection
         if (supply == 0) {
-            // First depositor: implement dead shares protection
-            shares = assets;
-
-            // Mint 1000 dead shares to address(1) to prevent inflation attacks
-            // This is a one-time protection for the vault
-            _mint(address(1), 1000);
-        } else {
-            // Calculate shares based on vault's current NAV
-            uint256 currentTotalAssets = _getTotalValueProtected();
-            shares = (assets * supply) / currentTotalAssets;
+            _mint(address(1), 10 ** DECIMAL_OFFSET); // 1000 dead shares
         }
+
+        // Calculate shares accounting for current leveraged state
+        shares = _convertToShares(assets);
 
         // Transfer WETH from depositor to vault
         WETH.safeTransferFrom(msg.sender, address(this), assets);
-
-        // Track legitimate deposits
-        _totalDeposited += assets;
 
         // Mint shares to receiver BEFORE leverage
         _mint(receiver, shares);
@@ -213,11 +258,6 @@ contract YieldNestLoopingVault is BaseVault {
             _unwindPosition(assets);
         }
 
-        // Update deposit tracking for withdrawal
-        _totalDeposited = _totalDeposited >= assets
-            ? _totalDeposited - assets
-            : 0;
-
         // Call parent withdraw which handles the standard ERC4626 logic
         return super.withdraw(assets, receiver, owner);
     }
@@ -242,11 +282,6 @@ contract YieldNestLoopingVault is BaseVault {
         if (loopingStorage.syncWithdraw) {
             _unwindPosition(assets);
         }
-
-        // Update deposit tracking for redemption
-        _totalDeposited = _totalDeposited >= assets
-            ? _totalDeposited - assets
-            : 0;
 
         // Call parent redeem which handles the standard ERC4626 logic
         return super.redeem(shares, receiver, owner);
@@ -274,6 +309,62 @@ contract YieldNestLoopingVault is BaseVault {
 
         uint256 shares = balanceOf(owner);
         return shares;
+    }
+
+    /**
+     * @notice Override convertToShares to use virtual shares logic
+     * @param assets Amount of assets to convert
+     * @return shares Amount of shares
+     */
+    function convertToShares(
+        uint256 assets
+    ) public view override returns (uint256 shares) {
+        return _convertToShares(assets);
+    }
+
+    /**
+     * @notice Override convertToAssets to use virtual shares logic
+     * @param shares Amount of shares to convert
+     * @return assets Amount of assets
+     */
+    function convertToAssets(
+        uint256 shares
+    ) public view override returns (uint256 assets) {
+        return _convertToAssets(shares);
+    }
+
+    /**
+     * @notice Override previewDeposit to use virtual shares logic
+     * @param assets Amount of assets to deposit
+     * @return shares Amount of shares that would be minted
+     */
+    function previewDeposit(
+        uint256 assets
+    ) public view override returns (uint256 shares) {
+        return _convertToShares(assets);
+    }
+
+    /**
+     * @notice Override previewWithdraw to use virtual shares logic
+     * @param assets Amount of assets to withdraw
+     * @return shares Amount of shares that would be burned
+     */
+    function previewWithdraw(
+        uint256 assets
+    ) public view override returns (uint256 shares) {
+        return _convertToShares(assets);
+    }
+
+    /**
+     * @notice Override previewRedeem to use virtual shares logic
+     * @param shares Amount of shares to redeem
+     * @return assets Amount of assets that would be received
+     */
+    function previewRedeem(
+        uint256 shares
+    ) public view override returns (uint256 assets) {
+        assets = _convertToAssets(shares);
+        return assets - _feeOnTotal(assets);
     }
 
     /**
@@ -338,12 +429,16 @@ contract YieldNestLoopingVault is BaseVault {
             );
 
             // 2. Calculate borrow amount in cbETH using oracle prices
-            uint256 wethPrice = AAVE_ORACLE.getAssetPrice(address(WETH));
-            uint256 cbETHPrice = AAVE_ORACLE.getAssetPrice(address(cbETH));
-            uint256 borrowValueUSD = (collateralAmount *
-                wethPrice *
-                targetLTV) / 10000;
-            uint256 borrowAmount = borrowValueUSD / cbETHPrice;
+            // Convert WETH collateral to USD, apply LTV, then convert to cbETH
+            uint256 collateralValueUSD = _convertTokenAmountToUSD(
+                collateralAmount,
+                address(WETH)
+            );
+            uint256 borrowValueUSD = (collateralValueUSD * targetLTV) / 10000;
+            uint256 borrowAmount = _convertUSDToTokenAmount(
+                borrowValueUSD,
+                address(cbETH)
+            );
 
             // 3. Borrow cbETH against WETH collateral
             AAVE_POOL.borrow(
@@ -371,8 +466,8 @@ contract YieldNestLoopingVault is BaseVault {
 
         emit LeverageExecuted(
             initialWETH,
-            loopingStorage.totalCollateral,
-            loopingStorage.totalDebt,
+            loopingStorage.totalCollateralUSD,
+            loopingStorage.totalDebtUSD,
             healthFactor
         );
     }
@@ -385,8 +480,9 @@ contract YieldNestLoopingVault is BaseVault {
         if (targetWithdrawAmount == 0) return;
 
         // Get current position
-        (uint256 totalCollateralUSD, uint256 totalDebtUSD, , , , ) = AAVE_POOL
-            .getUserAccountData(address(this));
+        (, uint256 totalDebtUSD, , , , ) = AAVE_POOL.getUserAccountData(
+            address(this)
+        );
 
         if (totalDebtUSD == 0) {
             // No leverage, just withdraw from Aave if needed
@@ -399,28 +495,34 @@ contract YieldNestLoopingVault is BaseVault {
         }
 
         // Calculate what percentage of the vault is being withdrawn
-        uint256 totalVaultValue = _getTotalValueProtected();
+        uint256 totalVaultValue = _getTotalValue();
         uint256 withdrawPercentage = (targetWithdrawAmount * 10000) /
             totalVaultValue;
 
         // Unwind that percentage of the position
         uint256 debtToRepay = (totalDebtUSD * withdrawPercentage) / 10000;
 
-        // Convert debt USD to cbETH amount
-        uint256 cbETHPrice = AAVE_ORACLE.getAssetPrice(address(cbETH));
-        uint256 cbETHToRepay = (debtToRepay * 1e10) / cbETHPrice; // Convert USD to cbETH amount
+        // Convert debt USD to cbETH amount using helper function
+        uint256 cbETHToRepay = _convertUSDToTokenAmount(
+            debtToRepay,
+            address(cbETH)
+        );
 
-        // Calculate WETH needed (with buffer for slippage)
-        uint256 wethForSwap = (cbETHToRepay * 11000) / 10000; // 110% for slippage
+        // Calculate ACTUAL WETH needed using Curve pricing (replaces crude 110% buffer)
+        uint256 wethForSwap = _getWETHNeededForCbETHDebt(cbETHToRepay);
 
         // Withdraw WETH from Aave
-        uint256 withdrawn = AAVE_POOL.withdraw(
+        AAVE_POOL.withdraw(
             address(WETH),
             wethForSwap + targetWithdrawAmount,
             address(this)
         );
 
         if (cbETHToRepay > 0) {
+            // Verify we have enough WETH for the swap
+            uint256 currentWETH = WETH.balanceOf(address(this));
+            require(currentWETH >= wethForSwap + targetWithdrawAmount, "Insufficient WETH after unwind");
+
             // Swap WETH to cbETH
             uint256 cbETHReceived = _swapWETHTocbETH(wethForSwap);
 
@@ -431,168 +533,17 @@ contract YieldNestLoopingVault is BaseVault {
 
         // Update position metrics
         _updatePositionMetrics();
-    }
 
-    /**
-     * @notice Completely unwind the leveraged position
-     */
-    function _completelyUnwindPosition() internal {
-        // Repay all debt iteratively using actual debt token balance
-        uint256 iterations = 0;
-        uint256 maxIterations = 15; // Increased safety limit
-
-        while (iterations < maxIterations) {
-            iterations++;
-
-            // Get current debt from Aave (this is the actual debt balance)
-            (, uint256 totalDebtUSD, , , , ) = AAVE_POOL.getUserAccountData(
+        // Emit position unwound event
+        if (cbETHToRepay > 0) {
+            (, , , , , uint256 healthFactor) = AAVE_POOL.getUserAccountData(
                 address(this)
             );
-            if (totalDebtUSD < 1e6) break; // Less than $1 USD debt, consider it zero
-
-            // Get cbETH price to convert USD debt to cbETH amount
-            uint256 cbETHPrice = AAVE_ORACLE.getAssetPrice(address(cbETH));
-            uint256 debtInCbETH = (totalDebtUSD * 1e18) / cbETHPrice; // Convert to cbETH amount
-
-            if (debtInCbETH < 1e15) break; // Less than 0.001 cbETH
-
-            // Calculate WETH needed to get enough cbETH (with generous buffer)
-            uint256 wethNeeded = (debtInCbETH * 11000) / 10000; // 110% of debt amount
-
-            // Try to withdraw WETH collateral
-            try
-                AAVE_POOL.withdraw(address(WETH), wethNeeded, address(this))
-            returns (uint256 withdrawn) {
-                if (withdrawn == 0) break;
-
-                // Swap WETH to cbETH to repay debt
-                uint256 cbETHReceived = _swapWETHTocbETH(withdrawn);
-
-                // Repay all available cbETH debt
-                if (cbETHReceived > 0) {
-                    cbETH.forceApprove(address(AAVE_POOL), cbETHReceived);
-                    AAVE_POOL.repay(
-                        address(cbETH),
-                        type(uint256).max,
-                        2,
-                        address(this)
-                    );
-                }
-            } catch {
-                // If withdrawal fails, try with 50% of the amount
-                try
-                    AAVE_POOL.withdraw(
-                        address(WETH),
-                        wethNeeded / 2,
-                        address(this)
-                    )
-                returns (uint256 withdrawn) {
-                    if (withdrawn > 0) {
-                        uint256 cbETHReceived = _swapWETHTocbETH(withdrawn);
-                        if (cbETHReceived > 0) {
-                            cbETH.forceApprove(
-                                address(AAVE_POOL),
-                                cbETHReceived
-                            );
-                            AAVE_POOL.repay(
-                                address(cbETH),
-                                type(uint256).max,
-                                2,
-                                address(this)
-                            );
-                        }
-                    }
-                } catch {
-                    // If still failing, break out
-                    break;
-                }
-            }
-        }
-
-        // Final cleanup: withdraw any remaining WETH collateral
-        try
-            AAVE_POOL.withdraw(address(WETH), type(uint256).max, address(this))
-        {} catch {}
-    }
-
-    /**
-     * @notice Partially unwind position for partial withdrawals
-     */
-    function _partiallyUnwindPosition(uint256 targetWithdrawAmount) internal {
-        // Check current WETH balance
-        uint256 currentWETHBalance = WETH.balanceOf(address(this));
-        if (currentWETHBalance >= targetWithdrawAmount) {
-            return; // Already have enough WETH
-        }
-
-        uint256 wethNeeded = targetWithdrawAmount - currentWETHBalance;
-
-        // Get current debt balance
-        uint256 currentDebt = cbETH.balanceOf(address(this));
-        if (currentDebt == 0) {
-            // No debt, just withdraw WETH collateral directly
-            AAVE_POOL.withdraw(address(WETH), wethNeeded, address(this));
-            return;
-        }
-
-        // Unwind position iteratively until we have enough WETH
-        uint256 iterations = 0;
-        uint256 maxIterations = loopCount + 2; // Safety limit
-
-        while (
-            WETH.balanceOf(address(this)) < targetWithdrawAmount &&
-            iterations < maxIterations
-        ) {
-            iterations++;
-
-            // Calculate how much debt to repay (start with smaller amounts)
-            uint256 debtToRepay = currentDebt /
-                (maxIterations - iterations + 1);
-            if (debtToRepay == 0) debtToRepay = 1e15; // Minimum 0.001 cbETH
-
-            // Calculate collateral to withdraw (with buffer for slippage)
-            uint256 collateralToWithdraw = (debtToRepay * 12000) / 10000; // 120% buffer
-
-            // Ensure we don't withdraw more than available
-            try
-                AAVE_POOL.withdraw(
-                    address(WETH),
-                    collateralToWithdraw,
-                    address(this)
-                )
-            returns (uint256 withdrawn) {
-                if (withdrawn == 0) break;
-
-                // Swap only what's needed to repay debt
-                uint256 wethForSwap = withdrawn;
-
-                // If we have more WETH than needed for debt repayment, keep some
-                if (withdrawn > debtToRepay) {
-                    wethForSwap = debtToRepay;
-                }
-
-                if (wethForSwap > 0) {
-                    // Swap WETH to cbETH to repay debt
-                    uint256 cbETHReceived = _swapWETHTocbETH(wethForSwap);
-
-                    // Repay cbETH debt
-                    if (cbETHReceived > 0) {
-                        cbETH.forceApprove(address(AAVE_POOL), cbETHReceived);
-                        AAVE_POOL.repay(
-                            address(cbETH),
-                            cbETHReceived,
-                            2,
-                            address(this)
-                        );
-                    }
-                }
-
-                currentDebt = cbETH.balanceOf(address(this));
-            } catch {
-                // If withdrawal fails, try with smaller amount
-                collateralToWithdraw = collateralToWithdraw / 2;
-                if (collateralToWithdraw < 1e15) break; // Too small, exit
-            }
+            emit PositionUnwound(
+                wethForSwap + targetWithdrawAmount,
+                cbETHToRepay,
+                healthFactor
+            );
         }
     }
 
@@ -647,16 +598,6 @@ contract YieldNestLoopingVault is BaseVault {
     }
 
     /**
-     * @notice Calculate safe withdrawal amount maintaining health factor
-     */
-    function _calculateSafeWithdrawal(
-        uint256 debtToRepay
-    ) internal view returns (uint256 collateralToWithdraw) {
-        // Conservative calculation: withdraw slightly more than needed
-        collateralToWithdraw = (debtToRepay * 11000) / 10000; // 110% of debt amount
-    }
-
-    /**
      * @notice Get current position metrics
      * @return collateral Total collateral in USD (8 decimals)
      * @return debt Total debt in USD (8 decimals)
@@ -683,8 +624,8 @@ contract YieldNestLoopingVault is BaseVault {
             return 1e18; // 1:1 if no shares exist
         }
 
-        // Get total vault value in ETH terms (protected from donations)
-        uint256 totalVaultValue = _getTotalValueProtected();
+        // Get total vault value in ETH terms
+        uint256 totalVaultValue = _getTotalValue();
 
         // Rate = total vault value / total shares
         rate = (totalVaultValue * 1e18) / totalShares;
@@ -695,41 +636,11 @@ contract YieldNestLoopingVault is BaseVault {
      * @return Total assets under management in base units
      */
     function totalAssets() public view override returns (uint256) {
-        return _getTotalValueProtected();
+        return _getTotalValue();
     }
 
     /**
-     * @notice Get total value of vault including leveraged positions (protected from donations)
-     * @return Total value in WETH terms
-     */
-    function _getTotalValueProtected() internal view returns (uint256) {
-        uint256 wethBalance = WETH.balanceOf(address(this));
-
-        // Ignore any WETH beyond what was deposited/withdrawn legitimately
-        if (wethBalance > _totalDeposited) {
-            wethBalance = _totalDeposited; // Cap at tracked amount
-        }
-
-        // Get Aave position value
-        (uint256 totalCollateralUSD, uint256 totalDebtUSD, , , , ) = AAVE_POOL
-            .getUserAccountData(address(this));
-
-        if (totalCollateralUSD == 0) {
-            return wethBalance;
-        }
-
-        uint256 wethPriceUSD = AAVE_ORACLE.getAssetPrice(address(WETH));
-        uint256 netPositionUSD = totalCollateralUSD > totalDebtUSD
-            ? totalCollateralUSD - totalDebtUSD
-            : 0;
-        // Convert from 8 decimals (USD) to 18 decimals (ETH wei)
-        uint256 netPositionETH = (netPositionUSD * 1e18) / wethPriceUSD;
-
-        return netPositionETH + wethBalance;
-    }
-
-    /**
-     * @notice Get total value of vault including leveraged positions (unprotected for internal use)
+     * @notice Get total value of vault including leveraged positions
      * @return Total value in WETH terms
      */
     function _getTotalValue() internal view returns (uint256) {
@@ -743,26 +654,73 @@ contract YieldNestLoopingVault is BaseVault {
             return wethBalance;
         }
 
-        uint256 wethPriceUSD = AAVE_ORACLE.getAssetPrice(address(WETH));
-        uint256 netPositionUSD = totalCollateralUSD > totalDebtUSD
-            ? totalCollateralUSD - totalDebtUSD
-            : 0;
-        // Convert from 8 decimals (USD) to 18 decimals (ETH wei)
-        uint256 netPositionETH = (netPositionUSD * 1e18) / wethPriceUSD;
+        // Get collateral in WETH terms (this is accurate since we deposited WETH)
+        uint256 wethCollateral = _convertUSDToTokenAmount(
+            totalCollateralUSD,
+            address(WETH)
+        );
 
-        return netPositionETH + wethBalance;
+        // Get debt in cbETH terms
+        uint256 cbETHDebt = _convertUSDToTokenAmount(
+            totalDebtUSD,
+            address(cbETH)
+        );
+
+        // Calculate ACTUAL cost to repay cbETH debt using Curve pricing
+        uint256 wethToRepayDebt = _getWETHNeededForCbETHDebt(cbETHDebt);
+
+        // Net position = collateral - cost to repay debt
+        uint256 netPositionWETH = wethCollateral > wethToRepayDebt
+            ? wethCollateral - wethToRepayDebt
+            : 0;
+
+        return wethBalance + netPositionWETH;
+    }
+
+    /**
+     * @notice Calculate WETH needed to acquire cbETH for debt repayment
+     * @param cbETHAmount Amount of cbETH debt to repay
+     * @return wethNeeded Amount of WETH needed (including slippage buffer)
+     */
+    function _getWETHNeededForCbETHDebt(uint256 cbETHAmount) internal view returns (uint256 wethNeeded) {
+        if (cbETHAmount == 0) return 0;
+
+        // Check the actual exchange rate: how much cbETH do we get for 1 WETH?
+        try CURVE_CBETH_ETH_POOL.get_dy(0, 1, 1e18) returns (uint256 cbETHPer1WETH) {
+            if (cbETHPer1WETH > 0) {
+                // Calculate WETH needed based on actual Curve rate
+                // If 1 WETH gets us cbETHPer1WETH cbETH, then we need:
+                wethNeeded = (cbETHAmount * 1e18) / cbETHPer1WETH;
+                
+                // Add 5% buffer for slippage and potential rate changes during execution
+                wethNeeded = (wethNeeded * 105) / 100;
+            } else {
+                // Fallback: assume 10% premium if rate is zero
+                wethNeeded = (cbETHAmount * 110) / 100;
+            }
+        } catch {
+            // Conservative fallback if Curve query fails: assume 10% premium
+            wethNeeded = (cbETHAmount * 110) / 100;
+        }
+
+        // Sanity check: never less than 1:1 oracle rate
+        if (wethNeeded < cbETHAmount) {
+            wethNeeded = cbETHAmount;
+        }
+
+        return wethNeeded;
     }
 
     /**
      * @notice Update position metrics from Aave
      */
     function _updatePositionMetrics() internal {
-        (uint256 totalCollateralETH, uint256 totalDebtETH, , , , ) = AAVE_POOL
+        (uint256 totalCollateralUSD, uint256 totalDebtUSD, , , , ) = AAVE_POOL
             .getUserAccountData(address(this));
 
         LoopingStorage storage loopingStorage = _getLoopingStorage();
-        loopingStorage.totalCollateral = totalCollateralETH;
-        loopingStorage.totalDebt = totalDebtETH;
+        loopingStorage.totalCollateralUSD = totalCollateralUSD;
+        loopingStorage.totalDebtUSD = totalDebtUSD;
     }
 
     /**
@@ -775,46 +733,6 @@ contract YieldNestLoopingVault is BaseVault {
 
         if (healthFactor < 1.1e18) {
             revert HealthFactorTooLow(healthFactor);
-        }
-    }
-
-    /**
-     * @notice Emergency rebalance function
-     */
-    function emergencyRebalance() external onlyRole(EMERGENCY_ROLE) {
-        (, , , , , uint256 healthFactor) = AAVE_POOL.getUserAccountData(
-            address(this)
-        );
-
-        if (healthFactor < 1.3e18) {
-            _emergencyDeleverage();
-        }
-    }
-
-    /**
-     * @notice Emergency deleveraging function
-     */
-    function _emergencyDeleverage() internal {
-        LoopingStorage storage loopingStorage = _getLoopingStorage();
-
-        // Withdraw 10% of collateral and repay debt
-        uint256 collateralToWithdraw = loopingStorage.totalCollateral / 10;
-
-        if (collateralToWithdraw > 0) {
-            uint256 withdrawn = AAVE_POOL.withdraw(
-                address(WETH),
-                collateralToWithdraw,
-                address(this)
-            );
-
-            uint256 cbETHReceived = _swapWETHTocbETH(withdrawn);
-
-            cbETH.forceApprove(address(AAVE_POOL), cbETHReceived);
-            AAVE_POOL.repay(address(cbETH), cbETHReceived, 2, address(this));
-
-            _updatePositionMetrics();
-
-            emit EmergencyDeleveraged(withdrawn, cbETHReceived);
         }
     }
 

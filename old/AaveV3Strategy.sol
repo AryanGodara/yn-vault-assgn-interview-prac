@@ -7,28 +7,58 @@ import {DataTypes} from "@aave/core-v3/contracts/protocol/libraries/types/DataTy
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IStrategy} from "src/interfaces/IStrategy.sol";
+import {IStrategy} from "./interfaces/IStrategy.sol";
+
+interface IAaveOracle {
+    function getAssetPrice(address asset) external view returns (uint256);
+}
+
+interface ICurvePool {
+    function exchange(
+        uint256 i,
+        uint256 j,
+        uint256 dx,
+        uint256 min_dy
+    ) external returns (uint256);
+    function get_dy(
+        uint256 i,
+        uint256 j,
+        uint256 dx
+    ) external view returns (uint256);
+}
 
 /**
- * @title AaveV3Strategy
- * @notice Strategy that deposits assets into Aave V3 for yield generation
- * @dev This strategy is designed to be simple and gas-efficient
+ * @title AaveV3LoopingStrategy
+ * @notice Leveraged looping strategy that supplies WETH to Aave, borrows cbETH, swaps to WETH via Curve
+ * @dev This strategy implements a leveraged loop to amplify WETH yields
  *
  * Key Design Decisions:
- * 1. Direct integration with Aave V3 (no SDK needed)
- * 2. Simple deposit/withdraw pattern (no complex rebalancing)
- * 3. Accurate yield tracking through aToken balance
- * 4. Emergency withdrawal capability
+ * 1. WETH supply to Aave V3 as collateral
+ * 2. cbETH borrowing against WETH collateral
+ * 3. Curve cbETH/WETH swapping for loop closure
+ * 4. Multiple loop iterations for leverage amplification
+ * 5. Health factor monitoring for safety
+ * 6. Position unwinding for withdrawals
  */
-contract AaveV3Strategy is IStrategy, Ownable {
+contract AaveV3LoopingStrategy is IStrategy, Ownable {
     using SafeERC20 for IERC20;
 
     /*//////////////////////////////////////////////////////////////
                             CONSTANTS
     //////////////////////////////////////////////////////////////*/
 
-    // Aave V3 Pool address - will be set based on chain
-    IPool public immutable AAVE_POOL;
+    // Protocol addresses (Ethereum Mainnet)
+    IPool public constant AAVE_POOL =
+        IPool(0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2);
+    IAaveOracle public constant AAVE_ORACLE =
+        IAaveOracle(0x54586bE62E3c3580375aE3723C145253060Ca0C2);
+    ICurvePool public constant CURVE_CBETH_ETH_POOL =
+        ICurvePool(0x5FAE7E604FC3e24fd43A72867ceBaC94c65b404A);
+
+    IERC20 public constant WETH =
+        IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    IERC20 public constant cbETH =
+        IERC20(0xBe9895146f7AF43049ca1c1AE358B0541Ea49704);
 
     /*//////////////////////////////////////////////////////////////
                             IMMUTABLES
@@ -36,34 +66,52 @@ contract AaveV3Strategy is IStrategy, Ownable {
 
     // Core addresses set at deployment
     address public immutable VAULT;
-    address public immutable ASSET;
-    address public immutable A_TOKEN;
+    address public immutable ASSET; // WETH
+    address public immutable A_WETH; // aWETH token
+    address public immutable DEBT_CBETH; // Variable debt cbETH token
 
     /*//////////////////////////////////////////////////////////////
                             STORAGE
     //////////////////////////////////////////////////////////////*/
 
-    // Performance tracking
+    // Strategy parameters
+    uint256 public targetLTV = 7000; // 70% LTV target (basis points)
+    uint256 public constant MAX_LTV = 7500; // 75% safety threshold
+    uint256 public loopCount = 3; // Number of leverage loops
+    uint256 public slippageTolerance = 1000; // 10% slippage tolerance (basis points)
+
+    // Position tracking
+    uint256 public totalCollateral; // Total WETH supplied to Aave
+    uint256 public totalDebt; // Total cbETH borrowed from Aave
     uint256 public lastReportedBalance; // Balance at last harvest
-    uint256 public totalDeposited; // Total ever deposited
-    uint256 public totalWithdrawn; // Total ever withdrawn
 
     // Safety limits
     uint256 public maxSingleWithdraw = type(uint256).max;
-
-    // Emergency pause state
     bool public emergencyPaused;
 
     /*//////////////////////////////////////////////////////////////
                             EVENTS
     //////////////////////////////////////////////////////////////*/
 
-    event Deposited(uint256 amount);
-    event Withdrawn(uint256 amount, uint256 actualWithdrawn);
+    event LeverageExecuted(
+        uint256 initialAmount,
+        uint256 finalCollateral,
+        uint256 finalDebt,
+        uint256 healthFactor
+    );
+    event PositionUnwound(
+        uint256 collateralWithdrawn,
+        uint256 debtRepaid,
+        uint256 healthFactor
+    );
+    event StrategyParametersUpdated(
+        uint256 targetLTV,
+        uint256 loopCount,
+        uint256 slippageTolerance
+    );
     event HarvestReport(uint256 totalAssets, uint256 profit, uint256 loss);
     event EmergencyWithdrawal(uint256 amount);
     event EmergencyPauseToggled(bool paused);
-    event MaxWithdrawUpdated(uint256 newMax);
 
     /*//////////////////////////////////////////////////////////////
                             ERRORS
@@ -74,6 +122,10 @@ contract AaveV3Strategy is IStrategy, Ownable {
     error Strategy__WithdrawFailed();
     error Strategy__EmergencyPaused();
     error Strategy__ZeroAddress();
+    error Strategy__HealthFactorTooLow(uint256 healthFactor);
+    error Strategy__InvalidLeverageParameters();
+    error Strategy__SwapFailed();
+    error Strategy__InsufficientLiquidity();
 
     /*//////////////////////////////////////////////////////////////
                             MODIFIERS
@@ -101,48 +153,43 @@ contract AaveV3Strategy is IStrategy, Ownable {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Initializes the strategy with vault and asset addresses
+     * @notice Initializes the looping strategy with vault and asset addresses
      * @param _vault Address of the vault that will use this strategy
-     * @param _asset Address of the asset to manage (USDC)
-     * @dev Gets the aToken address from Aave and sets up approvals
+     * @param _asset Address of the asset to manage (WETH)
+     * @dev Gets the aToken and debt token addresses from Aave and sets up approvals
      */
     constructor(address _vault, address _asset) Ownable(msg.sender) {
-        if (_asset == address(0)) {
-            revert Strategy__ZeroAddress();
+        if (_asset != address(WETH)) {
+            revert Strategy__InvalidAsset();
         }
-        // Allow _vault to be zero initially for deployment purposes
 
         VAULT = _vault;
         ASSET = _asset;
 
-        // Set Aave pool address based on chain ID
-        uint256 chainId = block.chainid;
-        if (chainId == 1) {
-            // Ethereum Mainnet
-            AAVE_POOL = IPool(0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2);
-        } else if (chainId == 84532) {
-            // Base Sepolia
-            AAVE_POOL = IPool(0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27);
-        } else if (chainId == 8453) {
-            // Base Mainnet
-            AAVE_POOL = IPool(0xA238Dd80C259a72e81d7e4664a9801593F98d1c5);
-        } else {
-            revert Strategy__InvalidAsset(); // Unsupported chain
-        }
-
-        // Get the reserve data from Aave to find the aToken address
-        // This is more reliable than hardcoding the aToken address
-        DataTypes.ReserveData memory reserveData = AAVE_POOL.getReserveData(
-            _asset
+        // Get WETH reserve data from Aave
+        DataTypes.ReserveData memory wethReserveData = AAVE_POOL.getReserveData(
+            address(WETH)
         );
-        address aTokenAddress = reserveData.aTokenAddress;
+        if (wethReserveData.aTokenAddress == address(0))
+            revert Strategy__InvalidAsset();
+        A_WETH = wethReserveData.aTokenAddress;
 
-        if (aTokenAddress == address(0)) revert Strategy__InvalidAsset();
-        A_TOKEN = aTokenAddress;
+        // Get cbETH reserve data from Aave
+        DataTypes.ReserveData memory cbethReserveData = AAVE_POOL
+            .getReserveData(address(cbETH));
+        if (cbethReserveData.variableDebtTokenAddress == address(0))
+            revert Strategy__InvalidAsset();
+        DEBT_CBETH = cbethReserveData.variableDebtTokenAddress;
 
-        // Approve Aave pool to spend our assets
-        // Using max approval to save gas on future deposits
-        IERC20(_asset).forceApprove(address(AAVE_POOL), type(uint256).max);
+        // Approve Aave pool to spend our tokens
+        IERC20(WETH).forceApprove(address(AAVE_POOL), type(uint256).max);
+        IERC20(cbETH).forceApprove(address(AAVE_POOL), type(uint256).max);
+
+        // Approve Curve pool to spend cbETH for swapping
+        IERC20(cbETH).forceApprove(
+            address(CURVE_CBETH_ETH_POOL),
+            type(uint256).max
+        );
 
         // Transfer ownership to vault for security (only if vault is not zero)
         if (_vault != address(0)) {
@@ -155,38 +202,89 @@ contract AaveV3Strategy is IStrategy, Ownable {
     //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Deposits all available assets into Aave
+     * @notice Executes leveraged looping strategy with available WETH
      * @dev Only callable by vault after user deposits
      *
-     * How Aave deposits work:
-     * 1. We supply assets to the pool
-     * 2. Aave mints aTokens to us 1:1
-     * 3. aTokens increase in balance over time as interest accrues
+     * Looping Strategy:
+     * 1. Supply WETH to Aave as collateral
+     * 2. Borrow cbETH against WETH collateral
+     * 3. Swap cbETH to WETH via Curve
+     * 4. Repeat for specified loop count
      */
     function deposit() external override onlyVault whenNotEmergencyPaused {
-        uint256 balance = IERC20(ASSET).balanceOf(address(this));
+        uint256 wethBalance = IERC20(WETH).balanceOf(address(this));
 
-        if (balance > 0) {
-            // Supply assets to Aave
-            // Parameters: asset, amount, onBehalfOf, referralCode
-            AAVE_POOL.supply(ASSET, balance, address(this), 0);
-
-            totalDeposited += balance;
-
-            emit Deposited(balance);
+        if (wethBalance > 0) {
+            _executeLeverageLoop(wethBalance);
         }
     }
 
     /**
-     * @notice Withdraws assets from Aave back to vault
-     * @param amount Amount of assets to withdraw
-     * @return withdrawn Actual amount withdrawn (may differ due to rounding)
-     * @dev Handles edge cases where requested amount exceeds available
-     *
-     * How Aave withdrawals work:
-     * 1. We request withdrawal of underlying assets
-     * 2. Aave burns equivalent aTokens
-     * 3. Assets are sent directly to specified receiver (vault)
+     * @notice Executes the leveraged looping strategy
+     * @param initialAmount Initial WETH amount to start the loop
+     */
+    function _executeLeverageLoop(uint256 initialAmount) internal {
+        uint256 currentWethAmount = initialAmount;
+
+        // Execute multiple loops for leverage amplification
+        for (uint256 i = 0; i < loopCount; i++) {
+            if (currentWethAmount == 0) break;
+
+            // 1. Supply WETH to Aave
+            AAVE_POOL.supply(
+                address(WETH),
+                currentWethAmount,
+                address(this),
+                0
+            );
+            totalCollateral += currentWethAmount;
+
+            // 2. Calculate how much cbETH we can borrow
+            uint256 borrowAmount = _calculateBorrowAmount(currentWethAmount);
+            if (borrowAmount == 0) break;
+
+            // 3. Borrow cbETH from Aave
+            AAVE_POOL.borrow(address(cbETH), borrowAmount, 2, 0, address(this)); // 2 = variable rate
+            totalDebt += borrowAmount;
+
+            // 4. Swap cbETH to WETH via Curve
+            currentWethAmount = _swapCbEthToWeth(borrowAmount);
+
+            // Safety check: ensure we got some WETH back
+            if (currentWethAmount == 0) break;
+        }
+
+        // Supply any remaining WETH
+        if (currentWethAmount > 0) {
+            AAVE_POOL.supply(
+                address(WETH),
+                currentWethAmount,
+                address(this),
+                0
+            );
+            totalCollateral += currentWethAmount;
+        }
+
+        // Check health factor after looping
+        uint256 healthFactor = _getHealthFactor();
+        if (healthFactor < 1.05e18) {
+            // Minimum 1.05 health factor
+            revert Strategy__HealthFactorTooLow(healthFactor);
+        }
+
+        emit LeverageExecuted(
+            initialAmount,
+            totalCollateral,
+            totalDebt,
+            healthFactor
+        );
+    }
+
+    /**
+     * @notice Withdraws assets by unwinding leveraged position
+     * @param amount Amount of WETH to withdraw
+     * @return withdrawn Actual amount withdrawn
+     * @dev Unwinds position proportionally to maintain health factor
      */
     function withdraw(
         uint256 amount
@@ -197,11 +295,11 @@ contract AaveV3Strategy is IStrategy, Ownable {
         whenNotEmergencyPaused
         returns (uint256 withdrawn)
     {
-        // Check available balance (aTokens represent our assets 1:1+yield)
-        uint256 available = IAToken(A_TOKEN).balanceOf(address(this));
+        if (amount == 0) return 0;
 
         // Cap withdrawal at available amount
-        uint256 toWithdraw = amount > available ? available : amount;
+        uint256 totalAssets_ = totalAssets();
+        uint256 toWithdraw = amount > totalAssets_ ? totalAssets_ : amount;
 
         // Safety check for single withdrawal limit
         toWithdraw = toWithdraw > maxSingleWithdraw
@@ -209,34 +307,125 @@ contract AaveV3Strategy is IStrategy, Ownable {
             : toWithdraw;
 
         if (toWithdraw > 0) {
-            // Withdraw from Aave directly to vault
-            // This saves gas vs withdrawing here then transferring
-            withdrawn = AAVE_POOL.withdraw(ASSET, toWithdraw, VAULT);
+            withdrawn = _unwindPosition(toWithdraw);
 
-            if (withdrawn == 0) revert Strategy__WithdrawFailed();
-
-            totalWithdrawn += withdrawn;
-
-            emit Withdrawn(toWithdraw, withdrawn);
+            // Transfer withdrawn WETH to vault
+            if (withdrawn > 0) {
+                IERC20(WETH).safeTransfer(VAULT, withdrawn);
+            }
         }
 
         return withdrawn;
     }
 
     /**
+     * @notice Unwinds leveraged position to withdraw specified amount
+     * @param targetWithdraw Target amount to withdraw
+     * @return actualWithdrawn Actual amount withdrawn
+     */
+    function _unwindPosition(
+        uint256 targetWithdraw
+    ) internal returns (uint256 actualWithdrawn) {
+        uint256 currentCollateral = IAToken(A_WETH).balanceOf(address(this));
+        uint256 currentDebt = IERC20(DEBT_CBETH).balanceOf(address(this));
+
+        if (currentCollateral == 0) return 0;
+
+        // Calculate proportion to unwind
+        uint256 withdrawRatio = (targetWithdraw * 1e18) / currentCollateral;
+        if (withdrawRatio > 1e18) withdrawRatio = 1e18;
+
+        uint256 debtToRepay = (currentDebt * withdrawRatio) / 1e18;
+        uint256 collateralToWithdraw = (currentCollateral * withdrawRatio) /
+            1e18;
+
+        // Unwind position iteratively
+        while (debtToRepay > 0 && collateralToWithdraw > 0) {
+            // Calculate how much collateral we can withdraw while maintaining health factor
+            uint256 maxWithdrawable = _calculateMaxWithdrawable();
+            uint256 toWithdrawNow = collateralToWithdraw > maxWithdrawable
+                ? maxWithdrawable
+                : collateralToWithdraw;
+
+            if (toWithdrawNow == 0) break;
+
+            // Withdraw WETH collateral
+            uint256 withdrawnWeth = AAVE_POOL.withdraw(
+                address(WETH),
+                toWithdrawNow,
+                address(this)
+            );
+
+            // Calculate how much cbETH we can buy with withdrawn WETH
+            uint256 cbEthToBuy = _calculateCbEthFromWeth(withdrawnWeth);
+            uint256 debtToRepayNow = debtToRepay > cbEthToBuy
+                ? cbEthToBuy
+                : debtToRepay;
+
+            if (debtToRepayNow > 0) {
+                // Swap WETH to cbETH via Curve
+                uint256 wethForSwap = _calculateWethForCbEth(debtToRepayNow);
+                if (wethForSwap <= withdrawnWeth) {
+                    uint256 cbEthReceived = _swapWethToCbEth(wethForSwap);
+
+                    // Repay cbETH debt
+                    if (cbEthReceived > 0) {
+                        uint256 repayAmount = cbEthReceived > debtToRepayNow
+                            ? debtToRepayNow
+                            : cbEthReceived;
+                        AAVE_POOL.repay(
+                            address(cbETH),
+                            repayAmount,
+                            2,
+                            address(this)
+                        );
+                        totalDebt -= repayAmount;
+                        debtToRepay -= repayAmount;
+                    }
+
+                    actualWithdrawn += withdrawnWeth - wethForSwap;
+                } else {
+                    actualWithdrawn += withdrawnWeth;
+                }
+            } else {
+                actualWithdrawn += withdrawnWeth;
+            }
+
+            totalCollateral -= toWithdrawNow;
+            collateralToWithdraw -= toWithdrawNow;
+
+            // Safety check
+            if (_getHealthFactor() < 1.05e18) break;
+        }
+
+        uint256 healthFactor = _getHealthFactor();
+        emit PositionUnwound(
+            actualWithdrawn,
+            currentDebt - IERC20(DEBT_CBETH).balanceOf(address(this)),
+            healthFactor
+        );
+    }
+
+    /**
      * @notice Returns total assets managed by this strategy
-     * @return Total value in underlying asset terms
-     * @dev aToken balance represents principal + accrued interest
-     *
-     * Understanding aToken accounting:
-     * - aTokens are rebasing tokens that increase in balance
-     * - The balance automatically reflects accrued interest
-     * - No need for complex calculations or oracle calls
+     * @return Total value in WETH terms (collateral - debt)
+     * @dev Calculates net position value considering leverage
      */
     function totalAssets() external view override returns (uint256) {
-        // aToken balance directly represents our total assets
-        // This includes both principal and accrued yield
-        return IAToken(A_TOKEN).balanceOf(address(this));
+        uint256 collateralValue = IAToken(A_WETH).balanceOf(address(this));
+        uint256 debtValue = _convertCbEthToWeth(
+            IERC20(DEBT_CBETH).balanceOf(address(this))
+        );
+
+        // Add any idle WETH balance
+        uint256 idleWeth = IERC20(WETH).balanceOf(address(this));
+
+        // Net position = collateral - debt + idle
+        if (collateralValue + idleWeth > debtValue) {
+            return collateralValue + idleWeth - debtValue;
+        } else {
+            return 0; // Prevent underflow in case of bad debt
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -249,31 +438,23 @@ contract AaveV3Strategy is IStrategy, Ownable {
      * @return profit Amount gained since last report
      * @return loss Amount lost since last report
      * @dev Called by vault during harvest() to calculate fees
-     *
-     * Yield calculation methodology:
-     * - Compare current aToken balance to last reported
-     * - Difference is the yield (profit) or loss
-     * - Update last reported for next harvest
      */
     function harvestAndReport()
         external
         override
         returns (uint256 totalAssets_, uint256 profit, uint256 loss)
     {
-        // Get current total assets from aToken balance
-        totalAssets_ = IAToken(A_TOKEN).balanceOf(address(this));
+        // Get current total assets (net position value)
+        totalAssets_ = this.totalAssets();
 
         // Calculate performance since last report
         if (totalAssets_ > lastReportedBalance) {
-            // We made profit from Aave yield
             profit = totalAssets_ - lastReportedBalance;
             loss = 0;
         } else if (totalAssets_ < lastReportedBalance) {
-            // We have a loss (shouldn't happen with Aave, but handle it)
             profit = 0;
             loss = lastReportedBalance - totalAssets_;
         } else {
-            // No change
             profit = 0;
             loss = 0;
         }
@@ -282,8 +463,174 @@ contract AaveV3Strategy is IStrategy, Ownable {
         lastReportedBalance = totalAssets_;
 
         emit HarvestReport(totalAssets_, profit, loss);
-
         return (totalAssets_, profit, loss);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        HELPER FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Calculates how much cbETH can be borrowed against WETH collateral
+     * @param wethAmount Amount of WETH being supplied
+     * @return borrowAmount Amount of cbETH that can be borrowed
+     */
+    function _calculateBorrowAmount(
+        uint256 wethAmount
+    ) internal view returns (uint256 borrowAmount) {
+        // Get WETH price from Aave oracle
+        uint256 wethPrice = AAVE_ORACLE.getAssetPrice(address(WETH));
+        uint256 cbethPrice = AAVE_ORACLE.getAssetPrice(address(cbETH));
+
+        if (wethPrice == 0 || cbethPrice == 0) return 0;
+
+        // Calculate USD value of WETH collateral
+        uint256 collateralValueUSD = (wethAmount * wethPrice) / 1e18;
+
+        // Calculate maximum borrow value in USD (target LTV)
+        uint256 maxBorrowValueUSD = (collateralValueUSD * targetLTV) / 10000;
+
+        // Convert to cbETH amount
+        borrowAmount = (maxBorrowValueUSD * 1e18) / cbethPrice;
+    }
+
+    /**
+     * @notice Swaps cbETH to WETH via Curve
+     * @param cbethAmount Amount of cbETH to swap
+     * @return wethReceived Amount of WETH received
+     */
+    function _swapCbEthToWeth(
+        uint256 cbethAmount
+    ) internal returns (uint256 wethReceived) {
+        if (cbethAmount == 0) return 0;
+
+        // Get expected output with slippage protection
+        uint256 expectedWeth = CURVE_CBETH_ETH_POOL.get_dy(1, 0, cbethAmount); // cbETH to ETH
+        uint256 minWeth = (expectedWeth * (10000 - slippageTolerance)) / 10000;
+
+        // Execute swap: cbETH (index 1) to ETH (index 0)
+        try CURVE_CBETH_ETH_POOL.exchange(1, 0, cbethAmount, minWeth) returns (
+            uint256 received
+        ) {
+            wethReceived = received;
+        } catch {
+            revert Strategy__SwapFailed();
+        }
+    }
+
+    /**
+     * @notice Swaps WETH to cbETH via Curve
+     * @param wethAmount Amount of WETH to swap
+     * @return cbethReceived Amount of cbETH received
+     */
+    function _swapWethToCbEth(
+        uint256 wethAmount
+    ) internal returns (uint256 cbethReceived) {
+        if (wethAmount == 0) return 0;
+
+        // Get expected output with slippage protection
+        uint256 expectedCbeth = CURVE_CBETH_ETH_POOL.get_dy(0, 1, wethAmount); // ETH to cbETH
+        uint256 minCbeth = (expectedCbeth * (10000 - slippageTolerance)) /
+            10000;
+
+        // Execute swap: ETH (index 0) to cbETH (index 1)
+        try CURVE_CBETH_ETH_POOL.exchange(0, 1, wethAmount, minCbeth) returns (
+            uint256 received
+        ) {
+            cbethReceived = received;
+        } catch {
+            revert Strategy__SwapFailed();
+        }
+    }
+
+    /**
+     * @notice Gets current health factor from Aave
+     * @return healthFactor Current health factor (1e18 = 100%)
+     */
+    function _getHealthFactor() internal view returns (uint256 healthFactor) {
+        (, , , , , uint256 hf) = AAVE_POOL.getUserAccountData(address(this));
+        return hf;
+    }
+
+    /**
+     * @notice Calculates maximum withdrawable collateral while maintaining health factor
+     * @return maxWithdrawable Maximum WETH that can be withdrawn
+     */
+    function _calculateMaxWithdrawable()
+        internal
+        view
+        returns (uint256 maxWithdrawable)
+    {
+        (
+            uint256 totalCollateralETH,
+            uint256 totalDebtETH,
+            ,
+            uint256 currentLiquidationThreshold,
+            ,
+
+        ) = AAVE_POOL.getUserAccountData(address(this));
+
+        if (totalDebtETH == 0) {
+            return IAToken(A_WETH).balanceOf(address(this));
+        }
+
+        // Calculate minimum collateral needed to maintain health factor > 1.05
+        uint256 minCollateralETH = (totalDebtETH * 10500) /
+            currentLiquidationThreshold; // 1.05 safety margin
+
+        if (totalCollateralETH > minCollateralETH) {
+            uint256 withdrawableETH = totalCollateralETH - minCollateralETH;
+            // Convert ETH value to WETH amount (assuming 1:1 for simplicity)
+            maxWithdrawable = withdrawableETH;
+        }
+    }
+
+    /**
+     * @notice Converts cbETH amount to equivalent WETH using oracle prices
+     * @param cbethAmount Amount of cbETH
+     * @return wethAmount Equivalent WETH amount
+     */
+    function _convertCbEthToWeth(
+        uint256 cbethAmount
+    ) internal view returns (uint256 wethAmount) {
+        if (cbethAmount == 0) return 0;
+
+        uint256 wethPrice = AAVE_ORACLE.getAssetPrice(address(WETH));
+        uint256 cbethPrice = AAVE_ORACLE.getAssetPrice(address(cbETH));
+
+        if (wethPrice == 0) return 0;
+
+        wethAmount = (cbethAmount * cbethPrice) / wethPrice;
+    }
+
+    /**
+     * @notice Calculates how much cbETH can be bought with given WETH
+     * @param wethAmount Amount of WETH
+     * @return cbethAmount Equivalent cbETH amount
+     */
+    function _calculateCbEthFromWeth(
+        uint256 wethAmount
+    ) internal view returns (uint256 cbethAmount) {
+        return CURVE_CBETH_ETH_POOL.get_dy(0, 1, wethAmount);
+    }
+
+    /**
+     * @notice Calculates how much WETH needed to buy given cbETH
+     * @param cbethAmount Amount of cbETH needed
+     * @return wethAmount WETH amount needed
+     */
+    function _calculateWethForCbEth(
+        uint256 cbethAmount
+    ) internal view returns (uint256 wethAmount) {
+        // This is an approximation - in practice you'd need to reverse the curve calculation
+        uint256 wethPrice = AAVE_ORACLE.getAssetPrice(address(WETH));
+        uint256 cbethPrice = AAVE_ORACLE.getAssetPrice(address(cbETH));
+
+        if (wethPrice == 0) return 0;
+
+        wethAmount = (cbethAmount * cbethPrice) / wethPrice;
+        // Add small buffer for slippage
+        wethAmount = (wethAmount * 10100) / 10000; // 1% buffer
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -293,25 +640,68 @@ contract AaveV3Strategy is IStrategy, Ownable {
     /**
      * @notice Emergency withdrawal of all funds to vault
      * @dev Can only be called by vault in emergency situations
-     *
-     * When to use emergency withdrawal:
-     * 1. Strategy is being replaced
-     * 2. Critical bug discovered
-     * 3. Aave protocol issue
-     * 4. Vault emergency shutdown
+     * Unwinds entire position regardless of health factor
      */
     function emergencyWithdraw() external override onlyVault {
-        uint256 balance = IAToken(A_TOKEN).balanceOf(address(this));
+        uint256 currentDebt = IERC20(DEBT_CBETH).balanceOf(address(this));
+        uint256 currentCollateral = IAToken(A_WETH).balanceOf(address(this));
 
-        if (balance > 0) {
-            // Withdraw everything directly to vault
-            uint256 withdrawn = AAVE_POOL.withdraw(ASSET, balance, VAULT);
+        uint256 totalWithdrawn = 0;
 
-            totalWithdrawn += withdrawn;
-            lastReportedBalance = 0;
+        // If we have debt, try to repay it first
+        if (currentDebt > 0) {
+            // Withdraw some collateral to repay debt
+            uint256 collateralToWithdraw = (currentCollateral * 8000) / 10000; // 80% of collateral
+            if (collateralToWithdraw > 0) {
+                uint256 withdrawnWeth = AAVE_POOL.withdraw(
+                    address(WETH),
+                    collateralToWithdraw,
+                    address(this)
+                );
 
-            emit EmergencyWithdrawal(withdrawn);
+                // Swap WETH to cbETH to repay debt
+                uint256 cbethReceived = _swapWethToCbEth(withdrawnWeth / 2); // Use half for repayment
+                if (cbethReceived > 0) {
+                    uint256 repayAmount = cbethReceived > currentDebt
+                        ? currentDebt
+                        : cbethReceived;
+                    AAVE_POOL.repay(
+                        address(cbETH),
+                        repayAmount,
+                        2,
+                        address(this)
+                    );
+                    totalDebt -= repayAmount;
+                }
+
+                totalWithdrawn += withdrawnWeth / 2; // Other half goes to vault
+            }
         }
+
+        // Withdraw remaining collateral
+        uint256 remainingCollateral = IAToken(A_WETH).balanceOf(address(this));
+        if (remainingCollateral > 0) {
+            uint256 withdrawn = AAVE_POOL.withdraw(
+                address(WETH),
+                remainingCollateral,
+                address(this)
+            );
+            totalWithdrawn += withdrawn;
+        }
+
+        // Transfer all WETH to vault
+        uint256 wethBalance = IERC20(WETH).balanceOf(address(this));
+        if (wethBalance > 0) {
+            IERC20(WETH).safeTransfer(VAULT, wethBalance);
+            totalWithdrawn = wethBalance; // Update to actual transferred amount
+        }
+
+        // Reset tracking variables
+        totalCollateral = 0;
+        totalDebt = IERC20(DEBT_CBETH).balanceOf(address(this)); // Update to remaining debt
+        lastReportedBalance = 0;
+
+        emit EmergencyWithdrawal(totalWithdrawn);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -319,18 +709,42 @@ contract AaveV3Strategy is IStrategy, Ownable {
     //////////////////////////////////////////////////////////////*/
 
     /**
+     * @notice Updates strategy parameters
+     * @param _targetLTV New target LTV in basis points
+     * @param _loopCount New loop count
+     * @param _slippageTolerance New slippage tolerance in basis points
+     */
+    function updateStrategyParameters(
+        uint256 _targetLTV,
+        uint256 _loopCount,
+        uint256 _slippageTolerance
+    ) external onlyOwner {
+        if (_targetLTV > MAX_LTV) revert Strategy__InvalidLeverageParameters();
+        if (_loopCount > 10) revert Strategy__InvalidLeverageParameters(); // Max 10 loops
+        if (_slippageTolerance > 5000)
+            revert Strategy__InvalidLeverageParameters(); // Max 50% slippage
+
+        targetLTV = _targetLTV;
+        loopCount = _loopCount;
+        slippageTolerance = _slippageTolerance;
+
+        emit StrategyParametersUpdated(
+            _targetLTV,
+            _loopCount,
+            _slippageTolerance
+        );
+    }
+
+    /**
      * @notice Sets maximum single withdrawal amount
-     * @param _max New maximum in asset units
-     * @dev Safety mechanism to prevent large atomic withdrawals
+     * @param _max New maximum in WETH units
      */
     function setMaxSingleWithdraw(uint256 _max) external onlyOwner {
         maxSingleWithdraw = _max;
-        emit MaxWithdrawUpdated(_max);
     }
 
     /**
      * @notice Toggle emergency pause state
-     * @dev Prevents deposits/withdrawals when paused
      */
     function toggleEmergencyPause() external onlyOwner {
         emergencyPaused = !emergencyPaused;
@@ -341,31 +755,17 @@ contract AaveV3Strategy is IStrategy, Ownable {
      * @notice Emergency function to recover stuck tokens
      * @param token Address of token to recover
      * @param amount Amount to recover
-     * @dev Only recovers tokens that aren't the main asset or aToken
      */
     function recoverToken(address token, uint256 amount) external onlyOwner {
-        if (token == ASSET || token == A_TOKEN) revert Strategy__InvalidAsset();
-        IERC20(token).safeTransfer(owner(), amount);
-    }
-
-    /**
-     * @notice Migrates strategy to a new vault
-     * @param _newVault Address of the new vault
-     * @dev Used for vault upgrades - must withdraw all funds first
-     */
-    function migrate(address _newVault) external onlyOwner {
-        if (_newVault == address(0)) revert Strategy__ZeroAddress();
-
-        // First withdraw all funds to current vault
-        uint256 balance = IAToken(A_TOKEN).balanceOf(address(this));
-        if (balance > 0) {
-            AAVE_POOL.withdraw(ASSET, balance, VAULT);
-            totalWithdrawn += balance;
-            lastReportedBalance = 0;
+        if (
+            token == address(WETH) ||
+            token == address(cbETH) ||
+            token == A_WETH ||
+            token == DEBT_CBETH
+        ) {
+            revert Strategy__InvalidAsset();
         }
-
-        // Transfer ownership to new vault
-        transferOwnership(_newVault);
+        IERC20(token).safeTransfer(owner(), amount);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -374,62 +774,90 @@ contract AaveV3Strategy is IStrategy, Ownable {
 
     /**
      * @notice Returns the vault address
-     * @return Address of the vault
      */
     function vault() external view override returns (address) {
         return VAULT;
     }
 
     /**
-     * @notice Returns the asset address
-     * @return Address of the underlying asset
+     * @notice Returns the asset address (WETH)
      */
     function asset() external view override returns (address) {
         return ASSET;
     }
 
     /**
-     * @notice Returns the current APY from Aave
-     * @return Current supply APY in ray units (1e27)
-     * @dev Useful for frontend display and monitoring
+     * @notice Returns current position metrics
+     * @return collateral Total WETH collateral in Aave
+     * @return debt Total cbETH debt in Aave
+     * @return healthFactor Current health factor
+     * @return netValue Net position value in WETH
      */
-    function getCurrentApy() external view returns (uint256) {
-        DataTypes.ReserveData memory reserveData = AAVE_POOL.getReserveData(
-            ASSET
-        );
-
-        // Rate is in ray (1e27), representing per-second interest
-        return reserveData.currentLiquidityRate;
-    }
-
-    /**
-     * @notice Checks if the asset reserve is paused in Aave
-     * @return True if paused, false otherwise
-     * @dev Important for monitoring and emergency procedures
-     */
-    function isAssetPaused() external view returns (bool) {
-        DataTypes.ReserveData memory reserveData = AAVE_POOL.getReserveData(
-            ASSET
-        );
-        // Check bit 60 of the configuration data (asset is paused)
-        return (reserveData.configuration.data >> 60) & 1 == 1;
-    }
-
-    /**
-     * @notice Returns utilization metrics for monitoring
-     * @return deposited Total ever deposited
-     * @return withdrawn Total ever withdrawn
-     * @return current Current balance in Aave
-     */
-    function getMetrics()
+    function getPositionMetrics()
         external
         view
-        returns (uint256 deposited, uint256 withdrawn, uint256 current)
+        returns (
+            uint256 collateral,
+            uint256 debt,
+            uint256 healthFactor,
+            uint256 netValue
+        )
     {
-        return (
-            totalDeposited,
-            totalWithdrawn,
-            IAToken(A_TOKEN).balanceOf(address(this))
+        collateral = IAToken(A_WETH).balanceOf(address(this));
+        debt = IERC20(DEBT_CBETH).balanceOf(address(this));
+        healthFactor = _getHealthFactor();
+        netValue = this.totalAssets();
+    }
+
+    /**
+     * @notice Returns current strategy parameters
+     */
+    function getStrategyParameters()
+        external
+        view
+        returns (
+            uint256 _targetLTV,
+            uint256 _loopCount,
+            uint256 _slippageTolerance
+        )
+    {
+        return (targetLTV, loopCount, slippageTolerance);
+    }
+
+    /**
+     * @notice Checks if WETH or cbETH reserves are paused in Aave
+     * @return wethPaused True if WETH is paused
+     * @return cbethPaused True if cbETH is paused
+     */
+    function areAssetsPaused()
+        external
+        view
+        returns (bool wethPaused, bool cbethPaused)
+    {
+        DataTypes.ReserveData memory wethReserveData = AAVE_POOL.getReserveData(
+            address(WETH)
         );
+        DataTypes.ReserveData memory cbethReserveData = AAVE_POOL
+            .getReserveData(address(cbETH));
+
+        wethPaused = (wethReserveData.configuration.data >> 60) & 1 == 1;
+        cbethPaused = (cbethReserveData.configuration.data >> 60) & 1 == 1;
+    }
+
+    /**
+     * @notice Returns current leverage ratio
+     * @return leverageRatio Current leverage (collateral / net value)
+     */
+    function getCurrentLeverageRatio()
+        external
+        view
+        returns (uint256 leverageRatio)
+    {
+        uint256 collateral = IAToken(A_WETH).balanceOf(address(this));
+        uint256 netValue = this.totalAssets();
+
+        if (netValue > 0) {
+            leverageRatio = (collateral * 1e18) / netValue;
+        }
     }
 }
