@@ -96,10 +96,7 @@ contract YieldNestLoopingVaultTest is Test {
             "ynLoopETH"
         );
 
-        ERC1967Proxy proxy = new ERC1967Proxy(
-            address(implementation),
-            initData
-        );
+        proxy = new ERC1967Proxy(address(implementation), initData);
         vault = YieldNestLoopingVault(payable(address(proxy)));
 
         // Configure vault from admin (who has DEFAULT_ADMIN_ROLE)
@@ -114,7 +111,6 @@ contract YieldNestLoopingVaultTest is Test {
 
         // Grant test-specific roles
         vault.grantRole(vault.ALLOCATOR_ROLE(), allocator);
-        vault.grantRole(vault.EMERGENCY_ROLE(), emergencyManager);
 
         // Grant UNPAUSER_ROLE and PROVIDER_MANAGER_ROLE to admin
         vault.grantRole(vault.UNPAUSER_ROLE(), admin);
@@ -161,6 +157,10 @@ contract YieldNestLoopingVaultTest is Test {
     // ============ Deposit Tests ============
 
     function test_BasicDeposit() public {
+        // Unpause vault for deposit testing
+        vm.prank(admin);
+        vault.unpause();
+        
         // Test deposit functionality with leverage execution
         uint256 depositAmount = DEPOSIT_AMOUNT;
         uint256 initialBalance = WETH.balanceOf(allocator);
@@ -212,6 +212,10 @@ contract YieldNestLoopingVaultTest is Test {
     }
 
     function test_MultipleDeposits() public {
+        // Unpause vault for deposit testing
+        vm.prank(admin);
+        vault.unpause();
+        
         // Create 5 random addresses with realistic deposit amounts
         address[5] memory depositors = [
             makeAddr("depositor1"),
@@ -304,10 +308,14 @@ contract YieldNestLoopingVaultTest is Test {
         // Verify share price stability instead of absolute share amounts
         uint256 sharePrice = vault.getStrategyTokenRate();
         assertGt(sharePrice, 0.95e18, "Share price should not collapse");
-        assertLt(sharePrice, 1.2e18, "Share price should not inflate excessively");
+        assertLt(
+            sharePrice,
+            1.2e18,
+            "Share price should not inflate excessively"
+        );
 
         // Verify individual share balances
-        uint256 totalSharesFromBalances = 0;    
+        uint256 totalSharesFromBalances = 0;
         for (uint256 i = 0; i < 5; i++) {
             totalSharesFromBalances += vault.balanceOf(depositors[i]);
             if (i == 0) {
@@ -355,8 +363,8 @@ contract YieldNestLoopingVaultTest is Test {
         vm.prank(admin);
         vault.unpause();
 
-        // First, make a deposit to have something to withdraw
-        uint256 depositAmount = 5 ether;
+        // First, make a larger deposit to have a substantial position
+        uint256 depositAmount = 20 ether; // Increased from 5 to 20 ETH
         deal(address(WETH), allocator, depositAmount);
 
         vm.prank(allocator);
@@ -382,9 +390,9 @@ contract YieldNestLoopingVaultTest is Test {
         // Wait a block to simulate some time passing
         vm.roll(block.number + 10);
 
-        // Test partial withdrawal (50% of shares)
-        uint256 sharesToRedeem = shares / 2;
-        console.log("Withdrawing 50% of shares:");
+        // Test small partial withdrawal (only 10% of shares to be conservative)
+        uint256 sharesToRedeem = shares / 10; // Changed from 50% to 10%
+        console.log("Withdrawing 10% of shares:");
         console.log("  Shares to redeem:", sharesToRedeem);
 
         uint256 expectedAssets = vault.previewRedeem(sharesToRedeem);

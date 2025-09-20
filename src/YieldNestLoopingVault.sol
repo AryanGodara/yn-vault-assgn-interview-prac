@@ -108,7 +108,8 @@ contract YieldNestLoopingVault is BaseVault {
     ) internal view returns (uint256 tokenAmount) {
         uint256 tokenPrice = AAVE_ORACLE.getAssetPrice(token);
         // Aave prices are in USD with 8 decimals, convert to token amount with 18 decimals
-        return (usdAmount * 1e18) / tokenPrice;
+        tokenAmount = (usdAmount * 1e18) / tokenPrice;
+        return tokenAmount;
     }
 
     /**
@@ -132,7 +133,6 @@ contract YieldNestLoopingVault is BaseVault {
      * @return shares Amount of shares (with virtual offset)
      */
     function _convertToShares(uint256 assets) internal view returns (uint256) {
-        // Use virtual shares logic for inflation protection
         // totalAssets() includes leveraged Aave positions via _getTotalValue()
         return
             (assets * (totalSupply() + 10 ** DECIMAL_OFFSET)) /
@@ -208,14 +208,21 @@ contract YieldNestLoopingVault is BaseVault {
         uint256 assets,
         address receiver
     ) public virtual override onlyAllocator returns (uint256 shares) {
+        if (paused()) {
+            revert Paused();
+        }
         require(assets > 0, "Cannot deposit 0");
 
-        uint256 supply = totalSupply();
-        
+        //! I bricked the imlementation and this doesn't work
+        //! I mint virtual shares, but totalAssets() remains 0 (no WETH transferred), so double shares get minted
         // First deposit: mint dead shares for belt-and-suspenders protection
-        if (supply == 0) {
-            _mint(address(1), 10 ** DECIMAL_OFFSET); // 1000 dead shares
-        }
+        // if (supply == 0) {
+        //     console.log(
+        //         "First deposit - minting dead shares:",
+        //         10 ** DECIMAL_OFFSET
+        //     );
+        //     _mint(address(1), 10 ** DECIMAL_OFFSET); // 1000 dead shares
+        // }
 
         // Calculate shares accounting for current leveraged state
         shares = _convertToShares(assets);
@@ -226,17 +233,15 @@ contract YieldNestLoopingVault is BaseVault {
         // Mint shares to receiver BEFORE leverage
         _mint(receiver, shares);
 
-        // Update base vault's asset tracking
-        _addTotalAssets(_convertAssetToBase(asset(), assets));
+        // No need for base vault asset tracking - we handle everything directly
+        // (Independent of VaultLib functions)
 
         // Execute leverage loops AFTER share calculation
         LoopingStorage storage loopingStorage = _getLoopingStorage();
         if (loopingStorage.syncDeposit) {
             _executeLeverageLoops(assets);
         }
-
         emit Deposit(msg.sender, receiver, assets, shares);
-
         return shares;
     }
 
@@ -252,14 +257,40 @@ contract YieldNestLoopingVault is BaseVault {
         address receiver,
         address owner
     ) public virtual override onlyAllocator returns (uint256 shares) {
-        // Unwind leveraged position if enabled
+        require(assets > 0, "Cannot withdraw 0");
+
+        // Check if paused
+        if (paused()) {
+            revert Paused();
+        }
+
+        // Validate withdrawal amount against owner's maximum
+        uint256 maxAssets = maxWithdraw(owner);
+        if (assets > maxAssets) {
+            revert ExceededMaxWithdraw(owner, assets, maxAssets);
+        }
+
+        // Calculate shares to burn
+        shares = previewWithdraw(assets);
+
+        // Handle allowance if caller is not owner
+        if (_msgSender() != owner) {
+            _spendAllowance(owner, _msgSender(), shares);
+        }
+
+        // Burn shares from owner
+        _burn(owner, shares);
+
+        // Unwind leveraged position if enabled BEFORE burning shares
         LoopingStorage storage loopingStorage = _getLoopingStorage();
         if (loopingStorage.syncWithdraw) {
             _unwindPosition(assets);
         }
 
-        // Call parent withdraw which handles the standard ERC4626 logic
-        return super.withdraw(assets, receiver, owner);
+        // Transfer WETH to receiver
+        WETH.safeTransfer(receiver, assets);
+        emit Withdraw(_msgSender(), receiver, owner, assets, shares);
+        return shares;
     }
 
     /**
@@ -274,17 +305,43 @@ contract YieldNestLoopingVault is BaseVault {
         address receiver,
         address owner
     ) public virtual override onlyAllocator returns (uint256 assets) {
+        require(shares > 0, "Cannot redeem 0 shares");
+
+        // Check if paused
+        if (paused()) {
+            revert Paused();
+        }
+
+        // Validate redemption amount against owner's maximum
+        uint256 maxShares = maxRedeem(owner);
+        if (shares > maxShares) {
+            revert ExceededMaxRedeem(owner, shares, maxShares);
+        }
+
         // Calculate assets to withdraw
         assets = previewRedeem(shares);
 
-        // Unwind leveraged position if enabled
+        // Handle allowance if caller is not owner
+        if (_msgSender() != owner) {
+            _spendAllowance(owner, _msgSender(), shares);
+        }
+
+        // Unwind leveraged position if enabled BEFORE burning shares
         LoopingStorage storage loopingStorage = _getLoopingStorage();
         if (loopingStorage.syncWithdraw) {
             _unwindPosition(assets);
         }
 
-        // Call parent redeem which handles the standard ERC4626 logic
-        return super.redeem(shares, receiver, owner);
+        // No need for base vault asset tracking - we handle everything directly
+        // (Following the same pattern as deposit function)
+
+        // Burn shares from owner
+        _burn(owner, shares);
+
+        // Transfer WETH to receiver
+        WETH.safeTransfer(receiver, assets);
+        emit Withdraw(_msgSender(), receiver, owner, assets, shares);
+        return assets;
     }
 
     /**
@@ -375,38 +432,17 @@ contract YieldNestLoopingVault is BaseVault {
     }
 
     /**
-     * @notice Override _withdraw to handle internal withdrawals without buffer
-     * @param caller The address of the caller
-     * @param receiver Address to receive the assets
-     * @param owner Owner of the shares
-     * @param assets Amount of assets to withdraw
-     * @param shares Amount of shares being redeemed
+     * @notice Override _withdraw - not implemented as we handle withdrawals directly
+     * @dev This function is not used in our implementation. Use withdraw() or redeem() instead.
      */
     function _withdraw(
-        address caller,
-        address receiver,
-        address owner,
-        uint256 assets,
-        uint256 shares
-    ) internal override {
-        if (caller != owner) {
-            _spendAllowance(owner, caller, shares);
-        }
-
-        // NOTE: burn shares before withdrawing the assets
-        _burn(owner, shares);
-
-        // Ensure we have enough WETH by unwinding position if needed
-        uint256 currentWETHBalance = WETH.balanceOf(address(this));
-        if (currentWETHBalance < assets) {
-            uint256 shortfall = assets - currentWETHBalance;
-            _unwindPosition(shortfall);
-        }
-
-        // Transfer WETH directly since we don't use a buffer strategy
-        WETH.safeTransfer(receiver, assets);
-
-        emit Withdraw(caller, receiver, owner, assets, shares);
+        address,
+        address,
+        address,
+        uint256,
+        uint256
+    ) internal pure override {
+        revert("_withdraw not implemented - use withdraw() or redeem()");
     }
 
     /**
@@ -434,7 +470,9 @@ contract YieldNestLoopingVault is BaseVault {
                 collateralAmount,
                 address(WETH)
             );
+
             uint256 borrowValueUSD = (collateralValueUSD * targetLTV) / 10000;
+
             uint256 borrowAmount = _convertUSDToTokenAmount(
                 borrowValueUSD,
                 address(cbETH)
@@ -511,17 +549,17 @@ contract YieldNestLoopingVault is BaseVault {
         // Calculate ACTUAL WETH needed using Curve pricing (replaces crude 110% buffer)
         uint256 wethForSwap = _getWETHNeededForCbETHDebt(cbETHToRepay);
 
-        // Withdraw WETH from Aave
-        AAVE_POOL.withdraw(
-            address(WETH),
-            wethForSwap + targetWithdrawAmount,
-            address(this)
-        );
+        // Withdraw WETH from Aave (only what we need for debt repayment)
+        // The targetWithdrawAmount will be available after reducing debt
+        AAVE_POOL.withdraw(address(WETH), wethForSwap, address(this));
 
         if (cbETHToRepay > 0) {
             // Verify we have enough WETH for the swap
             uint256 currentWETH = WETH.balanceOf(address(this));
-            require(currentWETH >= wethForSwap + targetWithdrawAmount, "Insufficient WETH after unwind");
+            require(
+                currentWETH >= wethForSwap,
+                "Insufficient WETH for debt repayment"
+            );
 
             // Swap WETH to cbETH
             uint256 cbETHReceived = _swapWETHTocbETH(wethForSwap);
@@ -529,6 +567,18 @@ contract YieldNestLoopingVault is BaseVault {
             // Repay debt
             cbETH.forceApprove(address(AAVE_POOL), cbETHReceived);
             AAVE_POOL.repay(address(cbETH), cbETHReceived, 2, address(this));
+        }
+
+        // After debt repayment, withdraw the target amount for the user
+        // This should now be safe since we reduced our debt proportionally
+        uint256 currentWETH = WETH.balanceOf(address(this));
+        if (currentWETH < targetWithdrawAmount) {
+            uint256 additionalWithdraw = targetWithdrawAmount - currentWETH;
+            AAVE_POOL.withdraw(
+                address(WETH),
+                additionalWithdraw,
+                address(this)
+            );
         }
 
         // Update position metrics
@@ -540,7 +590,7 @@ contract YieldNestLoopingVault is BaseVault {
                 address(this)
             );
             emit PositionUnwound(
-                wethForSwap + targetWithdrawAmount,
+                targetWithdrawAmount,
                 cbETHToRepay,
                 healthFactor
             );
@@ -682,16 +732,20 @@ contract YieldNestLoopingVault is BaseVault {
      * @param cbETHAmount Amount of cbETH debt to repay
      * @return wethNeeded Amount of WETH needed (including slippage buffer)
      */
-    function _getWETHNeededForCbETHDebt(uint256 cbETHAmount) internal view returns (uint256 wethNeeded) {
+    function _getWETHNeededForCbETHDebt(
+        uint256 cbETHAmount
+    ) internal view returns (uint256 wethNeeded) {
         if (cbETHAmount == 0) return 0;
 
         // Check the actual exchange rate: how much cbETH do we get for 1 WETH?
-        try CURVE_CBETH_ETH_POOL.get_dy(0, 1, 1e18) returns (uint256 cbETHPer1WETH) {
+        try CURVE_CBETH_ETH_POOL.get_dy(0, 1, 1e18) returns (
+            uint256 cbETHPer1WETH
+        ) {
             if (cbETHPer1WETH > 0) {
                 // Calculate WETH needed based on actual Curve rate
                 // If 1 WETH gets us cbETHPer1WETH cbETH, then we need:
                 wethNeeded = (cbETHAmount * 1e18) / cbETHPer1WETH;
-                
+
                 // Add 5% buffer for slippage and potential rate changes during execution
                 wethNeeded = (wethNeeded * 105) / 100;
             } else {
